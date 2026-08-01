@@ -20,7 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
 	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/gorm"
 
@@ -30,12 +29,8 @@ import (
 	platformstore "github.com/AlexChang1999/lucky-star-casino-go/internal/platform/store"
 )
 
-// mysqlErrDupEntry 是 MySQL 的重複鍵錯誤碼（ER_DUP_ENTRY）。
-//
-// ⚠️ 為什麼要認錯誤碼而不是用 INSERT IGNORE：IGNORE 會把**所有**錯誤
-// 降級成警告（截斷、NOT NULL、外鍵），於是一筆壞資料靜默變成 no-op——
-// 而餘額已經扣掉了。認 1062 只吞重複鍵這一種，其餘照樣往外炸。
-const mysqlErrDupEntry = 1062
+// mysqlErrDupEntry 與 isDupEntry 已移到 repository.go——正式路徑同樣需要辨識
+// 1062，留在測試檔會變成兩份定義。
 
 func openDB(t *testing.T) (*gorm.DB, context.Context) {
 	t.Helper()
@@ -168,12 +163,8 @@ func TestConditionalDebit(t *testing.T) {
 	const player = 990003
 	seedWallet(t, ctx, db, player, 1000)
 
-	const conditionalDebit = `
-		UPDATE wallets
-		   SET balance = balance - ?, version = version + 1, updated_at = CURRENT_TIMESTAMP(6)
-		 WHERE player_id = ?
-		   AND balance - frozen_amount >= ?
-		   AND NOT EXISTS (SELECT 1 FROM wallet_transactions t WHERE t.idempotency_key = ?)`
+	// ⚠️ 用的是 repository.go 裡那一份 conditionalDebit，不是複製一份 SQL 進來。
+	// 測試若自己抄一份，改壞了實作它照樣綠——那種測試比沒有測試更糟。
 
 	t.Run("餘額足夠則扣款成功", func(t *testing.T) {
 		res := db.WithContext(ctx).Exec(conditionalDebit, 300, player, 300, "debit-probe-1")
@@ -301,11 +292,6 @@ func readWallet(t *testing.T, ctx context.Context, db *gorm.DB, playerID int64) 
 		t.Fatalf("讀取錢包失敗: %v", err)
 	}
 	return row.Balance, row.Version
-}
-
-func isDupEntry(err error) bool {
-	var me *mysql.MySQLError
-	return errors.As(err, &me) && me.Number == mysqlErrDupEntry
 }
 
 func errString(err error) string {
