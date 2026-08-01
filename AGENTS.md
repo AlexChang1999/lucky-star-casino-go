@@ -52,7 +52,9 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 > **A 類（#1–#17）是從團隊 repo 原封不動帶走的**——它們看起來像「Java 專案的事」，
 > 其實是業務與架構本質，換語言一樣會踩。**這一類最容易漏。**
 > **B 類（#18–#25）是前身 Go 專案實際踩過的**，已驗證適用於 Go。
-> **C 類（#26–#31）是本專案新增的。**
+> **C 類（#26–#36）是本專案新增的**，其中 #30、#32、#34、#35 全部是
+> **PostgreSQL → MySQL** 的落差，而且全部**沒有錯誤訊息**——那正是 `docs/ADR-001`
+> 這個決定的真實代價，也是它最有價值的產出。
 > 之後真的踩到新雷，**當場往下加**（§5）。
 
 ### A 類：業務與架構本質（語言無關，必須全部帶走）
@@ -329,6 +331,60 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     但鎖順序會隨資料分布與執行計畫改變，「不可能死鎖」在 MySQL 上不是能保證的事。
     ⚠️ 重試安全的前提是**冪等鍵不變**（地雷 #4）——換鍵重試就是重複扣款。
     ⚠️ 只重試 1213 / 1205。1062 重試一萬次還是 1062，而餘額已經被扣掉了。
+
+35. **⭐⭐ MySQL 的 1062 不中止交易，所以照抄 Java 的 credit catch 會重複入帳**：
+    這是地雷 #34 的孿生兄弟——同一個「PG → MySQL」的落差，打在 credit 上，
+    而且方向相反：#34 是 MySQL **多**了一個失敗模式，這條是 MySQL **少**了一層保護。
+
+    Java 的 `WalletService.credit`（Step 5，`:220-233`）撞到唯一鍵衝突時
+    直接回查贏家並正常返回。那在 PostgreSQL 上活得下來，靠的是 **PG 的約束違反會讓
+    整筆交易 aborted**——catch 裡那句回查自己也會炸，於是交易回滾、餘額沒多加。
+    **Java 是被 PG 的語義意外保護的，不是它自己處理對了**（實際結局是 500）。
+    ⚠️ `WalletTransaction` 是 `GenerationType.IDENTITY`，所以 `save()` 會**立刻**
+    送出 INSERT，例外確實落在 try 區塊內——這是判斷結局的依據，不是推測。
+
+    InnoDB 的 1062 只是**語句級**失敗，交易還活著（`docs/ADR-002` 決策 4）。
+    逐行照抄的後果是：
+    ① 樂觀鎖存檔已經把 `balance + amount` 寫進去 → ② INSERT 撞 1062、流水沒寫
+    → ③ catch 回查贏家、正常 return → ④ **交易 commit**。
+    結果是**餘額多加了一次而流水只有一筆**，且**沒有任何錯誤訊息**。
+
+    可達的交錯（RC 之下是常態不是理論值）：
+    `T2 冪等檢查（查不到）→ T1 整筆提交 → T2 讀錢包（讀到新 version）
+    → T2 樂觀鎖過關 → T2 INSERT 撞 1062`。
+
+    解法：與 debit 的 `compensate` 對稱，**同交易內回沖**
+    （`internal/wallet/store.compensateCredit`），再回查贏家。
+    ⚠️ 回沖加回的必須是**實際解凍量**，不是請求帶進來的 `unfreezeAmount`：
+    Java 的 `max(0, frozen - unfreeze)` 會夾住超額請求，兩者可能不同。
+    加回請求值會讓 `frozen_amount` 憑空長大 → 可用餘額變小 → **假的餘額不足**，
+    而 `CHECK (frozen_amount >= 0)` 只擋負數，擋不住這個方向。
+    由 `TestCreditDupEntryDoesNotDoubleCredit` 釘住（拿掉補償就會紅在
+    「balance = 2000, want 1500」）。
+
+    ⚠️ **判準比這個案例更廣**：只要一筆交易「先做了寫入、再依賴一個可能失敗的
+    唯一鍵 INSERT」，從 PG 搬到 MySQL 時就要重新問一次
+    「這個錯誤之後交易還活著嗎？活著的話前面那些寫入怎麼辦？」
+
+36. **⭐ credit 是讀改寫 + 樂觀鎖，同玩家高併發下成功率是 1/N**：
+    團隊只對 debit 做過 T-090 B2 那次「壓成一條語句」的改寫，credit 到現在仍是
+    JPA 的讀改寫 + `@Version`（`WalletService.java:168-260`）。後果是可量測的：
+
+    | | debit（條件 UPDATE） | credit（讀改寫 + 樂觀鎖） |
+    |---|---|---|
+    | 20 筆同玩家不同鍵併發 | **20 筆全成功**（DB 序列化） | **成功 1、409 十九筆**（實測） |
+    | 往返數 | 3（+outbox） | 4（+outbox） |
+
+    N 個交易同時讀到 `version = v`，只有一個 UPDATE 得逞，其餘 N-1 個
+    `WHERE version = v` 全部落空。**PostgreSQL 的 EPQ 行為相同**，所以這不是
+    MySQL 的問題，是 Java 版的既有行為——`ErrConcurrentModification` → HTTP 409，
+    呼叫端帶**原本那把冪等鍵**重試（地雷 #4）。
+
+    ⚠️ **不要「順手」把 credit 也改成條件 UPDATE**。那樣做 409 會整個消失，
+    是對外行為漂移。要改必須先讓契約測試涵蓋它，再進藍圖 §5 當成刻意的改進。
+    ⚠️ 也**不要**在 store 層自動重試樂觀鎖衝突：重試權在知道冪等鍵怎麼來的那一層，
+    而且悄悄重掉會讓呼叫端從此再也看不到 409。
+    由 `TestCreditConcurrentSamePlayer` 釘住這個對照。
 
 ---
 

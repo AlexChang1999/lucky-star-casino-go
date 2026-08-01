@@ -51,6 +51,13 @@ var (
 	// ErrUnexpectedRowsAffected 代表條件 UPDATE 動到了非預期的列數。
 	// 主鍵條件下只可能是 0 或 1，出現其他值代表 SQL 被改壞了。
 	ErrUnexpectedRowsAffected = errors.New("條件更新影響列數異常")
+	// ErrConcurrentModification 是 credit 的樂觀鎖衝突，對應 Java 的
+	// ObjectOptimisticLockingFailureException（GlobalExceptionHandler:127 → HTTP 409）。
+	//
+	// ⚠️ 這是**呼叫端可以重試**的錯誤，但本層刻意不自動重試：Java 版把它原樣拋到
+	// HTTP 邊界，內部悄悄重掉會讓呼叫端從此再也看不到 409，那是契約漂移不是修 bug。
+	// 重試時必須帶原本那把冪等鍵（地雷 #4），所以重試權在知道鍵怎麼來的那一層。
+	ErrConcurrentModification = errors.New("錢包已被其他交易更新（樂觀鎖衝突）")
 )
 
 // ── 帳務語句 ────────────────────────────────────────────────────────────────
@@ -89,6 +96,53 @@ const restoreBalance = `
 	   SET balance = balance + ?, version = version + 1, updated_at = CURRENT_TIMESTAMP(6)
 	 WHERE player_id = ?`
 
+// ── credit 的帳務語句 ───────────────────────────────────────────────────────
+//
+// credit 與 debit **形狀不同**，不是漏抄：團隊沒有對 credit 做過 T-090 B2 那次
+// 「壓成一條語句」的改寫，它到現在仍是 JPA 的讀改寫 + `@Version` 樂觀鎖
+// （`WalletService.java:168-260`）。照著 debit 的樣子把 credit 也壓成條件 UPDATE
+// 是「品味」而不是「等價」——那樣做會讓樂觀鎖衝突（409）這個既有的對外行為消失。
+
+// loadWalletForCredit 是 credit 的往返 2，對齊 Java 的 `walletRepository.findById`。
+//
+// ⚠️ 刻意是**非鎖定讀**。改成 `FOR UPDATE` 會變成悲觀鎖——那樣也是對的，
+// 但樂觀鎖衝突從此不會發生，`ErrConcurrentModification` 變成死碼，409 消失。
+// credit 的併發保護在往返 3 的 `WHERE version = ?`，不在這裡。
+const loadWalletForCredit = `SELECT balance, frozen_amount, version FROM wallets WHERE player_id = ?`
+
+// applyCredit 是 credit 的樂觀鎖存檔（往返 3），對齊 JPA `@Version` 產生的 UPDATE。
+//
+// ⚠️ 三個都不可以「順手簡化」的地方：
+//   - `balance = ?` 是**絕對值**，不是 `balance = balance + ?`。改成增量看起來
+//     更原子、更安全，但那樣 `WHERE version = ?` 就變成裝飾品，樂觀鎖衝突
+//     再也不會發生。要等價的是整組語義，不是單一語句的原子性。
+//   - `WHERE version = ?` 是樂觀鎖本體。少了它就是無聲覆蓋別人的更新
+//     （lost update）——沒有錯誤訊息，只有一個對不起來的餘額。
+//   - `version = version + 1` 讓「有匹配」必然「有異動」，於是
+//     RowsAffected == 0 只有一種解讀（docs/ADR-002 決策 1 的註記）。
+const applyCredit = `
+	UPDATE wallets
+	   SET balance = ?, frozen_amount = ?, version = version + 1, updated_at = CURRENT_TIMESTAMP(6)
+	 WHERE player_id = ?
+	   AND version = ?`
+
+// ⭐ restoreCredit 是 credit 版的補償回沖（AGENTS.md 地雷 #35）。
+//
+// 為什麼 credit 也需要補償，而 Java 版看起來沒有：Java 的 catch（:220-233）在
+// PostgreSQL 上其實回不了正常值——PG 的唯一鍵衝突讓**整筆交易 aborted**，
+// catch 裡那句回查自己也會炸，結局是交易回滾（餘額沒多加）。
+// MySQL 的 1062 只是語句級失敗，交易還活著（docs/ADR-002 決策 4），
+// 逐行照抄就會變成「餘額加了、流水沒寫、正常 commit」——**重複入帳，零錯誤訊息**。
+//
+// ⚠️ 第二個參數是**實際解凍量**，不是請求帶進來的 `unfreezeAmount`。
+// Java 的 `max(0, frozen - unfreeze)` 會夾住超額的請求（:200），兩者可能不同；
+// 加回請求值會讓 frozen_amount 憑空長大 → 可用餘額變小 → **假的餘額不足**。
+// schema 的 CHECK 只擋負數，擋不住這個方向。
+const restoreCredit = `
+	UPDATE wallets
+	   SET balance = balance - ?, frozen_amount = frozen_amount + ?, version = version + 1, updated_at = CURRENT_TIMESTAMP(6)
+	 WHERE player_id = ?`
+
 // ⭐ debitTxOptions：扣款交易跑在 READ COMMITTED，而不是 MySQL 預設的
 // REPEATABLE READ。這是本檔最重要的一行，理由有兩個，**兩個都是實測出來的**
 // （AGENTS.md 地雷 #32、#34，證據見 repository_infra_test.go）：
@@ -106,6 +160,25 @@ const restoreBalance = `
 // ⚠️ 只設在這一筆交易上，不改全域也不改連線預設——別的地方要不要 RC
 // 是別的地方自己的決定，偷偷改掉全域預設會讓後來的人完全看不出哪裡變了。
 var debitTxOptions = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+
+// ⭐ creditTxOptions：入帳交易同樣跑在 READ COMMITTED，但**理由只有一半**。
+//
+// 與 debit 的差異值得記住，因為它示範了「同一個結論可以有不同的推導」：
+//
+//   - 地雷 #34（gap lock 死鎖）**不適用**。那個死鎖來自條件 UPDATE 裡的
+//     `NOT EXISTS` 子查詢，credit 沒有它——往返 1 的冪等檢查是一次普通的
+//     一致性讀，在 RR 之下不上任何鎖，自然也不會下 gap lock。
+//   - 地雷 #32（RR 快照）**適用，而且換了個入口**。往返 1 就是這筆交易的
+//     第一次一致性讀，快照在那一刻固定；往返 2 讀到的 version 因此可能是舊的，
+//     而往返 3 的 UPDATE 是鎖定讀、看的是最新值 → `WHERE version = ?` 恆不成立
+//     → 憑空多出一批 Java 版不會有的 409。
+//     連帶地，1062 之後的回查也看不到贏家（與 debit 同一個機制）。
+//
+// PostgreSQL 的預設就是 READ COMMITTED，所以 Java 版兩件事都沒遇過。
+// ⚠️ 與 debitTxOptions 值相同但**刻意分成兩個變數**：隔離級別是 per-transaction
+// 的決定（docs/ADR-002 決策 6），合併成一個共用變數會讓「改一個等於改兩個」，
+// 而它們的理由並不相同。
+var creditTxOptions = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
 
 // maxDeadlockRetries 是縱深防禦。
 //
@@ -178,6 +251,26 @@ func (r *Repository) Debit(ctx context.Context, m domain.Movement) (DebitResult,
 		return DebitResult{}, fmt.Errorf("%w: Debit 只接受 DEBIT，得到 %q", domain.ErrUnknownTxType, m.Type)
 	}
 
+	return withRetry(ctx, r, debitTxOptions, m, r.debitTx)
+}
+
+// withRetry 把「開一筆交易跑 fn，遇到可重試的鎖衝突就重開一筆重做」包起來。
+//
+// 為什麼是泛型自由函式而不是方法：Go 的**方法不能有型別參數**，
+// 而 debit 與 credit 的回傳型別不同。這是 Java 泛型的類比破功處之一——
+// Java 可以寫 `<T> T withRetry(...)` 當成實例方法，Go 不行。
+//
+// ⚠️ 重試安全的前提是**冪等鍵不變**（AGENTS.md 地雷 #4）：Movement 是傳值的
+// 唯讀資料，重做用的是同一把鍵，所以不會重複入帳／扣款。換鍵重試就是重複記帳。
+// ⚠️ 只重試 1213 / 1205（見 isRetryable）。1062 重試一萬次還是 1062。
+func withRetry[T any](
+	ctx context.Context,
+	r *Repository,
+	opts *sql.TxOptions,
+	m domain.Movement,
+	fn func(tx *gorm.DB, m domain.Movement) (T, error),
+) (T, error) {
+	var zero T
 	var lastErr error
 	for attempt := 0; attempt <= maxDeadlockRetries; attempt++ {
 		if attempt > 0 {
@@ -186,34 +279,36 @@ func (r *Repository) Debit(ctx context.Context, m domain.Movement) (DebitResult,
 			delay := time.Duration(attempt)*2*time.Millisecond + rand.N(3*time.Millisecond)
 			select {
 			case <-ctx.Done():
-				return DebitResult{}, ctx.Err()
+				return zero, ctx.Err()
 			case <-time.After(delay):
 			}
 		}
 
-		var result DebitResult
+		var result T
 		err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var err error
-			result, err = r.debitTx(tx, m)
+			result, err = fn(tx, m)
 			return err
-		}, debitTxOptions)
+		}, opts)
 		switch {
 		case err == nil:
 			return result, nil
 		case !isRetryable(err):
-			return DebitResult{}, err
+			return zero, err
 		}
 		lastErr = err
 		// 用 Warn 而不是吞掉：死鎖重試成功時外部完全無感，
 		// 但「重試率突然升高」是鎖競爭惡化的早期訊號，要看得見。
-		r.logger.Warn("扣款遇到可重試的鎖衝突，重試",
+		r.logger.Warn("帳務交易遇到可重試的鎖衝突，重試",
 			"attempt", attempt+1,
+			"type", m.Type,
 			"playerID", m.PlayerID,
 			"idempotencyKey", m.IdempotencyKey,
 			"err", err,
 		)
 	}
-	return DebitResult{}, fmt.Errorf("扣款重試 %d 次仍失敗: %w", maxDeadlockRetries, lastErr)
+	return zero, fmt.Errorf("帳務交易重試 %d 次仍失敗（type=%s, key=%q）: %w",
+		maxDeadlockRetries, m.Type, m.IdempotencyKey, lastErr)
 }
 
 func (r *Repository) debitTx(tx *gorm.DB, m domain.Movement) (DebitResult, error) {
@@ -351,6 +446,34 @@ func (r *Repository) compensate(tx *gorm.DB, m domain.Movement) (DebitResult, er
 
 // debitResultOf 把一筆既有流水翻譯成「冪等命中」的回應。
 func (r *Repository) debitResultOf(row transactionRow, m domain.Movement) (DebitResult, error) {
+	hit, err := r.idempotentHitOf(row, m)
+	if err != nil {
+		return DebitResult{}, err
+	}
+	return DebitResult{
+		TransactionID: hit.TransactionID,
+		PlayerID:      hit.PlayerID,
+		Amount:        hit.Amount,
+		BalanceBefore: hit.BalanceBefore,
+		BalanceAfter:  hit.BalanceAfter,
+		Idempotent:    true,
+	}, nil
+}
+
+// idempotentHit 是 debit 與 credit 的冪等命中共同欄位。
+//
+// 兩邊的差別只有 `CreditResult.FrozenAfter`，所以共用這一份而不是各寫一次：
+// 底下那兩段（跨玩家碰撞的留痕、餘額欄位為 NULL 的判斷）都是**很難重新推導出來**
+// 的判斷，複製兩份必定漂移，而漂移的症狀是「credit 的碰撞沒人看得到」。
+type idempotentHit struct {
+	TransactionID int64
+	PlayerID      int64
+	Amount        domain.Amount
+	BalanceBefore domain.Amount
+	BalanceAfter  domain.Amount
+}
+
+func (r *Repository) idempotentHitOf(row transactionRow, m domain.Movement) (idempotentHit, error) {
 	if row.PlayerID != m.PlayerID {
 		// 冪等鍵跨玩家碰撞 = 呼叫端的鍵命名有 bug（正規鍵都以 playerID 當 namespace）。
 		// ⚠️ 沿用 Java 語意：**回原交易值而不是拋錯**，但大聲留痕讓它可被監控發現
@@ -368,15 +491,222 @@ func (r *Repository) debitResultOf(row transactionRow, m domain.Movement) (Debit
 		// 回 0 是靜默的錯誤數字（本專案最想避免的形狀）；把整條鏈路改成
 		// *Amount 則是為了一個「所有 Java 寫入路徑都會設值、只可能來自手動改資料」
 		// 的狀態，永久付出指標成本。所以選擇明確報錯。
-		return DebitResult{}, fmt.Errorf("%w: txID=%d", ErrTransactionBalanceMissing, row.ID)
+		return idempotentHit{}, fmt.Errorf("%w: txID=%d", ErrTransactionBalanceMissing, row.ID)
 	}
-	return DebitResult{
+	return idempotentHit{
 		TransactionID: row.ID,
 		PlayerID:      row.PlayerID,
 		Amount:        domain.Amount(row.Amount),
 		BalanceBefore: domain.Amount(*row.BalanceBefore),
 		BalanceAfter:  domain.Amount(*row.BalanceAfter),
-		Idempotent:    true,
+	}, nil
+}
+
+// ── credit ─────────────────────────────────────────────────────────────────
+
+// CreditResult 是一次入帳的結果，對齊 Java 的 CreditResponse。
+//
+// ⚠️ FrozenAfter 是 *Amount 而不是 Amount（AGENTS.md 地雷 #33）：
+// Java 在**冪等命中**時明確回 `null`，註解寫「不重算凍結；以當初入帳結果為準」
+// （WalletService.java:179、:229）。用 Amount 的話那個 null 會靜靜變成 0，
+// 而 0 是一個**合法的凍結金額**——呼叫端分不出「沒有這個資訊」與「凍結金額是 0」。
+// 契約測試會直接看到這個差異。
+type CreditResult struct {
+	TransactionID int64
+	PlayerID      int64
+	Amount        domain.Amount
+	BalanceBefore domain.Amount
+	BalanceAfter  domain.Amount
+	FrozenAfter   *domain.Amount
+	Idempotent    bool
+}
+
+// Credit 執行一次入帳，並在**同一筆交易**內把 wallet.credit 事件寫進 outbox。
+//
+// 流程（對齊 Java WalletService.credit 168-260）：
+//
+//	往返 1  以冪等鍵查流水 → 命中就零副作用回原結果（FrozenAfter = nil）
+//	往返 2  載入錢包（balance / frozen_amount / version）
+//	        └ 不存在 → ErrWalletNotFound。credit **不需要餘額守衛**，因為是加錢
+//	往返 3  樂觀鎖存檔：UPDATE ... WHERE version = ?
+//	        └ ⭐ RowsAffected == 0 = 併發衝突 → ErrConcurrentModification（409）
+//	往返 4  INSERT 流水
+//	        └ 1062 → 同交易內補償回沖 + 回查贏家（地雷 #35），**不 rollback**
+//	往返 5  INSERT outbox（同一交易，地雷 #5）
+//
+// ⚠️ 比 debit 多兩趟往返。這不是寫壞了，是「Java 版沒對 credit 做 B2 改寫」的
+// 直接後果（docs/notes/Java版-wallet-帳務口徑.md §4）。壓測報告裡 credit 就是
+// 比較慢的那一邊，**不要為了數字好看而偷偷改成條件 UPDATE**。
+//
+// ⚠️ 往返 1 的「先查再寫」不是冪等的全部保護，只是快路徑；真正的保護是往返 4 的
+// UNIQUE 衝突（地雷 #3）。**兩層都要留**：砍掉往返 1，正常重送會走進昂貴路徑；
+// 砍掉往返 4 的處理，那就是一個 race。
+func (r *Repository) Credit(ctx context.Context, m domain.Movement) (CreditResult, error) {
+	// 與 Debit 對稱的型別守衛：Movement 是可以手動組出來的 struct，
+	// 擋在這裡的成本是一個 if，漏掉的成本是一筆 type='DEBIT' 的入帳流水。
+	if m.Type != domain.TxTypeCredit {
+		return CreditResult{}, fmt.Errorf("%w: Credit 只接受 CREDIT，得到 %q", domain.ErrUnknownTxType, m.Type)
+	}
+	return withRetry(ctx, r, creditTxOptions, m, r.creditTx)
+}
+
+func (r *Repository) creditTx(tx *gorm.DB, m domain.Movement) (CreditResult, error) {
+	amount := int64(m.Amount)
+
+	// ── 往返 1：冪等快路徑 ──────────────────────────────────────────────
+	existing, found, err := findTxByKey(tx, m.IdempotencyKey)
+	if err != nil {
+		return CreditResult{}, err
+	}
+	if found {
+		return r.creditResultOf(existing, m)
+	}
+
+	// ── 往返 2：載入錢包 ────────────────────────────────────────────────
+	var balanceBefore, frozenBefore, version int64
+	err = tx.Raw(loadWalletForCredit, m.PlayerID).Row().Scan(&balanceBefore, &frozenBefore, &version)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return CreditResult{}, fmt.Errorf("%w: playerID=%d", ErrWalletNotFound, m.PlayerID)
+	case err != nil:
+		return CreditResult{}, fmt.Errorf("載入錢包失敗（playerID=%d）: %w", m.PlayerID, err)
+	}
+	balanceAfter := balanceBefore + amount
+
+	// 選填解凍，夾在 [0, frozenBefore]。
+	// ⚠️ 超額**不拒絕請求**，只夾住並留痕——對齊 Java（WalletService.java:196-200）。
+	// 改成回 400 會讓現有呼叫端從「成功入帳」變成失敗，那是行為漂移。
+	unfrozen := int64(m.UnfreezeAmount)
+	if unfrozen > frozenBefore {
+		r.logger.Warn("解凍金額超過目前凍結金額，夾到 0",
+			"playerID", m.PlayerID,
+			"requested", unfrozen,
+			"frozenAmount", frozenBefore,
+			"idempotencyKey", m.IdempotencyKey,
+		)
+		unfrozen = frozenBefore
+	}
+	frozenAfter := frozenBefore - unfrozen
+
+	// ── 往返 3：樂觀鎖存檔 ──────────────────────────────────────────────
+	res := tx.Exec(applyCredit, balanceAfter, frozenAfter, m.PlayerID, version)
+	if res.Error != nil {
+		return CreditResult{}, fmt.Errorf("入帳存檔失敗: %w", res.Error)
+	}
+	switch res.RowsAffected {
+	case 0:
+		// ⭐ 這一行就是 Java 的 @Version 幫你做掉、Go 必須自己寫的那一步。
+		// GORM **不會**為 0 列回傳 error（AGENTS.md 地雷 #3）——少了這個
+		// switch，一次被別人蓋掉的更新會靜靜地被當成成功，然後往下寫流水、
+		// 發事件。結果是流水說加了錢、餘額說沒有，**而且沒有錯誤訊息**。
+		return CreditResult{}, fmt.Errorf("%w: playerID=%d version=%d", ErrConcurrentModification, m.PlayerID, version)
+	case 1:
+		// 存檔成功，往下走。
+	default:
+		// 主鍵 + version 條件下不可能，出現代表 WHERE 被改壞了。
+		return CreditResult{}, fmt.Errorf("%w: 入帳影響了 %d 列", ErrUnexpectedRowsAffected, res.RowsAffected)
+	}
+
+	// ── 往返 4：寫流水。UNIQUE 索引衝突才是冪等的真正保證 ──────────────
+	row := transactionRow{
+		PlayerID:       m.PlayerID,
+		Type:           string(m.Type),
+		SubType:        string(m.SubType),
+		Amount:         amount,
+		BalanceBefore:  &balanceBefore,
+		BalanceAfter:   &balanceAfter,
+		IdempotencyKey: m.IdempotencyKey,
+		ReferenceID:    domain.OptionalString(m.ReferenceID),
+	}
+	err = tx.Create(&row).Error
+	switch {
+	case isDupEntry(err):
+		// ⭐ 地雷 #35：餘額**已經加上去了**，這裡不補償就是重複入帳。
+		return r.compensateCredit(tx, m, unfrozen)
+	case err != nil:
+		return CreditResult{}, fmt.Errorf("寫入帳務流水失敗: %w", err)
+	}
+
+	// ── 往返 5：事件進 outbox（同一交易）──────────────────────────────
+	event := domain.CreditEvent{
+		TransactionID:  row.ID,
+		PlayerID:       m.PlayerID,
+		Amount:         m.Amount,
+		BalanceBefore:  domain.Amount(balanceBefore),
+		BalanceAfter:   domain.Amount(balanceAfter),
+		SubType:        m.SubType,
+		IdempotencyKey: m.IdempotencyKey,
+		ReferenceID:    domain.OptionalString(m.ReferenceID),
+	}
+	if err := appendOutbox(tx, domain.TopicWalletCredit, m.PlayerID, event); err != nil {
+		return CreditResult{}, err
+	}
+
+	frozen := domain.Amount(frozenAfter)
+	return CreditResult{
+		TransactionID: row.ID,
+		PlayerID:      m.PlayerID,
+		Amount:        m.Amount,
+		BalanceBefore: domain.Amount(balanceBefore),
+		BalanceAfter:  domain.Amount(balanceAfter),
+		FrozenAfter:   &frozen,
+		Idempotent:    false,
+	}, nil
+}
+
+// ⭐ compensateCredit 處理併發同鍵競態：對手先寫進了同一把冪等鍵，
+// 而**這筆交易已經把錢加進去了**（AGENTS.md 地雷 #35）。
+//
+// 可達的交錯是這一個（RC 之下是真的會發生，不是理論值）：
+//
+//	T2 往返 1（查不到）→ T1 整筆提交 → T2 往返 2（讀到**新的** version）
+//	→ T2 往返 3 樂觀鎖過關 → T2 往返 4 撞 1062
+//
+// ⚠️ 與 debit 的 compensate 一樣**不回傳錯誤讓交易 rollback**，而是就地回沖
+// 再回贏家的結果——理由同 docs/ADR-002：credit 可能被包在外層交易裡
+// （商城退款、場次結算），丟錯誤會把外層整筆拖垮。
+//
+// ⚠️ unfrozen 是**實際解凍量**（已被夾過），不是 m.UnfreezeAmount。
+func (r *Repository) compensateCredit(tx *gorm.DB, m domain.Movement, unfrozen int64) (CreditResult, error) {
+	res := tx.Exec(restoreCredit, int64(m.Amount), unfrozen, m.PlayerID)
+	if res.Error != nil {
+		return CreditResult{}, fmt.Errorf("補償回沖失敗（playerID=%d）: %w", m.PlayerID, res.Error)
+	}
+	if res.RowsAffected != 1 {
+		// 回沖沒生效代表錢真的多了一筆。回錯誤讓整筆交易回滾，淨額同樣歸零，
+		// 但錯誤會浮上來被看見——比默默多一筆帳好。
+		return CreditResult{}, fmt.Errorf("%w: 補償回沖影響了 %d 列", ErrUnexpectedRowsAffected, res.RowsAffected)
+	}
+
+	// ⚠️ 這一句能讀到贏家，靠的是交易跑在 READ COMMITTED（見 creditTxOptions）。
+	// RR 之下快照在往返 1 就固定了，贏家是之後才提交的——普通 SELECT 看不到它。
+	winner, found, err := findTxByKey(tx, m.IdempotencyKey)
+	if err != nil {
+		return CreditResult{}, err
+	}
+	if !found {
+		return CreditResult{}, fmt.Errorf("%w: key=%q", ErrIdempotencyWinnerMissing, m.IdempotencyKey)
+	}
+	return r.creditResultOf(winner, m)
+}
+
+// creditResultOf 把一筆既有流水翻譯成「冪等命中」的回應。
+func (r *Repository) creditResultOf(row transactionRow, m domain.Movement) (CreditResult, error) {
+	hit, err := r.idempotentHitOf(row, m)
+	if err != nil {
+		return CreditResult{}, err
+	}
+	return CreditResult{
+		TransactionID: hit.TransactionID,
+		PlayerID:      hit.PlayerID,
+		Amount:        hit.Amount,
+		BalanceBefore: hit.BalanceBefore,
+		BalanceAfter:  hit.BalanceAfter,
+		// ⚠️ 明確是 nil，對齊 Java 的 `.frozenAfter(null)`（:179、:229）——
+		// 「不重算凍結；以當初入帳結果為準」。回目前的凍結金額看起來更有用，
+		// 但那會讓同一支 API 在冪等命中與否時回傳**不同時間點**的凍結金額。
+		FrozenAfter: nil,
+		Idempotent:  true,
 	}, nil
 }
 

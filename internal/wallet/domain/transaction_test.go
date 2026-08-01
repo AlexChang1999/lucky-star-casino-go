@@ -98,10 +98,11 @@ func TestNewDebit(t *testing.T) {
 
 func TestNewCredit(t *testing.T) {
 	tests := []struct {
-		name    string
-		amount  Amount
-		subType SubType
-		wantErr error
+		name     string
+		amount   Amount
+		subType  SubType
+		unfreeze Amount
+		wantErr  error
 	}{
 		{name: "派彩", amount: 250, subType: SubTypeWin},
 		{name: "每日簽到", amount: 50, subType: SubTypeCheckin},
@@ -123,11 +124,31 @@ func TestNewCredit(t *testing.T) {
 			name: "subType 必填", amount: 100, subType: "",
 			wantErr: ErrUnknownSubType,
 		},
+		{
+			// 對齊 Java 的 @PositiveOrZero：0 是**正常值**不是「沒帶」。
+			name: "解凍 0 是合法的", amount: 250, subType: SubTypeWin, unfreeze: 0,
+		},
+		{
+			name: "帶解凍", amount: 250, subType: SubTypeWin, unfreeze: 100,
+		},
+		{
+			// ⚠️ 這裡**不**檢查 unfreeze 是否超過目前凍結金額——那要等到 store
+			// 那層讀到真正的 frozen_amount 才知道，而且 Java 的做法是夾住不是拒絕。
+			name:   "解凍金額超過任何合理值仍然合法（夾住是 store 的事）",
+			amount: 250, subType: SubTypeWin, unfreeze: 1 << 40,
+		},
+		{
+			// ⭐ 負的解凍會讓 store 那層的 frozen_amount **變大**，於是可用餘額
+			// 憑空變小，症狀是之後下注拿到「餘額不足」而餘額看起來明明夠。
+			// schema 的 CHECK (frozen_amount >= 0) 擋不住這個方向。
+			name: "解凍不可為負", amount: 250, subType: SubTypeWin, unfreeze: -1,
+			wantErr: ErrInvalidUnfreezeAmount,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := NewCredit(42, tt.amount, tt.subType, "credit-42-"+tt.name, "round-1")
+			got, err := NewCredit(42, tt.amount, tt.subType, "credit-42-"+tt.name, "round-1", tt.unfreeze)
 
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
@@ -144,7 +165,28 @@ func TestNewCredit(t *testing.T) {
 			if got.ReferenceID != "round-1" {
 				t.Errorf("ReferenceID = %q, want %q", got.ReferenceID, "round-1")
 			}
+			if got.UnfreezeAmount != tt.unfreeze {
+				t.Errorf("UnfreezeAmount = %d, want %d", got.UnfreezeAmount, tt.unfreeze)
+			}
 		})
+	}
+}
+
+// TestUnfreezeOnlyOnCredit 釘住「只有 CREDIT 可以解凍」這條不變式。
+//
+// ⚠️ 走公開建構子時觸發不了（NewDebit 硬編 unfreeze=0），所以直接呼叫 newMovement。
+// 這正是「測試與被測程式同一個套件」的價值：不變式測得到，而不是只能靠註解宣稱。
+// 沒有這條，一個手工組出來的 Movement{Type: DEBIT, UnfreezeAmount: 500} 會在
+// store 那層被**靜靜忽略**——不會報錯，只會有一個沒被解凍的凍結金額。
+func TestUnfreezeOnlyOnCredit(t *testing.T) {
+	_, err := newMovement(42, TxTypeDebit, SubTypeBet, 100, 500, "debit-with-unfreeze", "")
+	if !errors.Is(err, ErrUnfreezeNotAllowed) {
+		t.Fatalf("err = %v, want errors.Is(err, %v)", err, ErrUnfreezeNotAllowed)
+	}
+
+	// 反向：DEBIT 帶 unfreeze=0 是正常的。
+	if _, err := newMovement(42, TxTypeDebit, SubTypeBet, 100, 0, "debit-no-unfreeze", ""); err != nil {
+		t.Fatalf("DEBIT 帶 unfreeze=0 應該合法，得到: %v", err)
 	}
 }
 

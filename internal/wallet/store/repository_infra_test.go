@@ -254,7 +254,7 @@ func TestDebitRejectsNonDebitMovement(t *testing.T) {
 	env := newTestEnv(t)
 	seedWallet(t, env.ctx, env.db, 42, 1000)
 
-	credit, err := domain.NewCredit(42, 100, domain.SubTypeWin, "wrong-direction", "")
+	credit, err := domain.NewCredit(42, 100, domain.SubTypeWin, "wrong-direction", "", 0)
 	if err != nil {
 		t.Fatalf("建立入帳意圖失敗: %v", err)
 	}
