@@ -122,6 +122,30 @@ Step 6  wallet.credit 事件寫進 wallet_outbox（同一交易）
 
 ⚠️ **冪等命中時 `frozenAfter` 回 `null`**（`WalletService.java:179`），
 註解寫「不重算凍結；以當初入帳結果為準」。這是刻意的，契約測試會看到。
+→ Go 版因此用 `*Amount`（地雷 #33）：回 0 會被讀成「凍結金額是 0」，
+那是一個**合法但錯誤**的數字。
+
+### ⭐ Step 5 的 catch 在 PostgreSQL 上其實回不了正常值（2026-08-02 複驗）
+
+`:220-233` 看起來是「撞唯一鍵 → 回查贏家 → 正常返回」，但 **PG 的約束違反會讓
+整筆交易 aborted**，catch 裡那句 `findByIdempotencyKey` 自己也會炸 →
+交易回滾 → 餘額沒多加 → 對外是 500。
+**Java 是被 PG 的語義意外保護的，不是它自己處理對了。**
+
+複驗依據（不是推測）：`postgres/entity/WalletTransaction.java:28` 是
+`@GeneratedValue(strategy = GenerationType.IDENTITY)`，所以 `save()` 必須**立刻**
+送出 INSERT 才拿得到主鍵，例外確實落在 try 區塊內、而不是延到 commit。
+
+⚠️ **MySQL 沒有這層保護**（1062 只是語句級失敗），逐行照抄就是**重複入帳**。
+Go 版必須自己補償回沖 —— 見 `AGENTS.md` 地雷 #35 與 `docs/ADR-002` 決策 7c。
+
+### ⭐ 讀改寫 + 樂觀鎖的併發代價（2026-08-02 實測）
+
+Go 版實測：**20 筆同玩家、不同冪等鍵的併發入帳 → 成功 1、409 十九筆。**
+N 個交易同時讀到 `version = v`，只有一個 UPDATE 得逞。
+PostgreSQL 的 EPQ 行為相同，所以**這是 Java 版的既有行為**，不是 MySQL 引入的。
+對照組：debit 走條件 UPDATE，同樣條件下 20 筆全成功。
+→ 這就是 T-090 B2 那次改寫的價值，而 credit 沒做。見 `AGENTS.md` 地雷 #36。
 
 ---
 

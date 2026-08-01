@@ -5,6 +5,102 @@
 
 ---
 
+## [feat] — 2026-08-02 — wallet credit：讀改寫 + 樂觀鎖，並補上 Java 版沒有的補償回沖
+
+Phase A 的第三個切片。credit 與 debit **形狀不同**——團隊只對 debit 做過
+T-090 B2 那次「壓成一條語句」的改寫，credit 到現在仍是 JPA 的讀改寫 + `@Version`
+（`WalletService.java:168-260`，已逐行讀過）。本輪刻意**保留那個形狀**，
+並在兩個 MySQL 與 PostgreSQL 行為不同的地方自己補上保護。
+HTTP 層、`wallet.credit.request` 指令消費者、outbox poller 仍未實作。
+
+**Added**
+
+- **`internal/wallet/store.Repository.Credit`——入帳路徑**。
+  冪等快路徑 → 載入錢包 → 樂觀鎖存檔 → 寫流水 → 寫 outbox，全部在**同一筆交易**裡。
+  credit **沒有餘額守衛**（是加錢），所以餘額 0 也照入不誤；
+  選填解凍以 `max(0, frozen - unfreeze)` 夾住並 `log.Warn`，**不拒絕請求**
+  ——對齊 Java（`:196-200`），改成回 400 會讓現有呼叫端從成功變失敗。
+- **`domain.Movement.UnfreezeAmount` 與 `NewCredit` 的 unfreeze 參數**，
+  含「負數不合法」與「只有 CREDIT 可解凍」兩條驗證。
+  ⚠️ 負的解凍會讓 `frozen_amount` **變大** → 可用餘額憑空變小 → 之後下注拿到
+  **假的餘額不足**，而 `CHECK (frozen_amount >= 0)` 只擋負數、擋不住這個方向。
+- **`CreditResult.FrozenAfter` 是 `*Amount`**（地雷 #33）：Java 在冪等命中時
+  明確回 `null`（`:179`、`:229`，註解寫「不重算凍結；以當初入帳結果為準」）。
+  用 `Amount` 的話那個 null 會靜靜變成 0——而 0 是一個**合法的凍結金額**，
+  呼叫端分不出「沒有這個資訊」與「凍結金額是 0」。
+- **地雷 #35 / #36**（見下）與 `docs/ADR-002` 決策 7（a~d 四小節）。
+
+**Changed**
+
+- **`domain.DebitEvent` → `domain.MovementEvent`，`DebitEvent` / `CreditEvent`
+  改為型別別名**。Java 的兩個 record（`WalletDebitEvent` / `WalletCreditEvent`）
+  component **完全相同**（8 個、同名同序同型，已逐行比對）——那是 Java 沒有型別
+  別名的結果，不是刻意的語義區分。複製兩份 Go struct 只會得到兩個必定漂移的定義，
+  而漂移的症狀是「某個 topic 的 payload 少一個欄位」，沒有錯誤訊息。
+  ⚠️ 用 `=`（別名）而不是 `type X MovementEvent`（新型別）：要的是同一個型別的
+  兩個名字，不是兩個需要顯式轉換的型別。
+- **debit 的死鎖重試迴圈抽成泛型的 `withRetry`**，credit 共用。
+  ⚠️ Go 的**方法不能有型別參數**，所以它是自由函式而不是 `*Repository` 的方法
+  ——這是 Java 泛型的類比破功處之一。
+- **`debitResultOf` 的共同邏輯抽成 `idempotentHitOf`**：跨玩家碰撞的留痕與
+  「餘額欄位為 NULL」的判斷都很難重新推導，複製兩份必定漂移，
+  而漂移的症狀是「credit 的碰撞沒人看得到」。
+
+**⭐⭐ 地雷 #35：MySQL 的 1062 不中止交易，所以照抄 Java 的 catch 會重複入帳**
+
+本輪最重要的發現，是地雷 #34 的孿生兄弟——同一個 PG→MySQL 落差、方向相反：
+#34 是 MySQL **多**了一個失敗模式，這條是 MySQL **少**了一層保護。
+
+Java 的 Step 5 catch（`:220-233`）撞唯一鍵時直接回查贏家並正常返回。那在
+PostgreSQL 上活得下來，靠的是 **PG 的約束違反會讓整筆交易 aborted**——catch 裡
+那句回查自己也會炸，於是交易回滾、餘額沒多加。**Java 是被 PG 的語義意外保護的，
+不是它自己處理對了**（實際結局是 500）。
+複驗依據：`WalletTransaction` 是 `GenerationType.IDENTITY`，`save()` 必須立刻送出
+INSERT 才拿得到主鍵，所以例外確實落在 try 區塊內——不是推測。
+
+InnoDB 的 1062 只是**語句級**失敗，交易還活著（`ADR-002` 決策 4）。逐行照抄的結果：
+樂觀鎖存檔已經把錢加進去 → INSERT 撞 1062、流水沒寫 → catch 正常 return →
+**交易 commit** → **餘額多加一次而流水只有一筆，且沒有任何錯誤訊息**。
+
+⚠️ 這推翻了決策 4 當初的樂觀語氣（「這一條比原版簡單」）——**用在 credit 上它反而
+更危險**。解法是與 debit 對稱的 `compensateCredit`，且回沖加回的必須是**實際解凍量**
+而不是請求值（兩者因為 clamp 可能不同）。
+
+**⭐ 地雷 #36：credit 同玩家高併發的成功率是 1/N（實測）**
+
+| | debit（條件 UPDATE） | credit（讀改寫 + 樂觀鎖） |
+|---|---|---|
+| 20 筆同玩家不同鍵併發 | **20 筆全成功**（DB 序列化） | **成功 1、409 十九筆** |
+| 熱路徑往返數 | 3（+outbox） | 4（+outbox） |
+
+N 個交易同時讀到 `version = v`，只有一個 UPDATE 得逞。**PostgreSQL 的 EPQ 行為
+相同**，所以這是 Java 版的既有行為、不是 MySQL 引入的。
+⚠️ **刻意不改**：壓成條件 UPDATE 會讓 409 這個對外行為消失（藍圖 §5 第 8 條）；
+store 層也**不自動重試**樂觀鎖衝突——重試權在知道冪等鍵怎麼來的那一層，
+悄悄重掉會讓呼叫端再也看不到 409。
+
+**如何驗證**
+
+```
+go vet ./... && go vet -tags=infra ./...          # 通過
+go test -race ./...                                # 通過
+go test -race -tags=infra ./...                    # 通過（wallet/store 27.5s）
+```
+
+新增 7 條 credit infra 測試。其中 `TestCreditDupEntryDoesNotDoubleCredit`
+是地雷 #35 的證據：拿掉 `compensateCredit` 它會紅在
+「balance = 2000, want 1500」。
+⚠️ 它**手工重演**往返 2~4 而不是呼叫 `Credit()`——要打中的窗口在往返 1 與往返 2
+之間，而兩者都是非鎖定讀，**沒辦法用行鎖把執行緒卡在它們中間**。
+
+⚠️ 過程中試過用 `information_schema.innodb_trx` 的 `LOCK WAIT` 當編排的同步點，
+**實測查不到**那筆等待中的交易（goroutine dump 明確顯示它卡在 `applyCredit` 的
+`Exec` 上，而 innodb_trx 只列得出對手那一筆）。已改成「確認被測交易尚未結束」，
+並在註解記下：這個測試**沒有靜默通過的路徑**——編排若沒成立，credit 會成功，
+`want ErrConcurrentModification` 那條斷言直接紅。
+
+---
+
 ## [feat] — 2026-08-01 — wallet debit 熱路徑：條件扣款 + 冪等 + Outbox 同交易
 
 Phase A 的第二個切片，也是**第一段真的會動到餘額的程式碼**。

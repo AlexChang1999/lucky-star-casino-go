@@ -108,6 +108,8 @@ var (
 	ErrIdempotencyKeyRequired   = errors.New("冪等鍵不可為空")
 	ErrIdempotencyKeyTooLong    = errors.New("冪等鍵超過長度上限")
 	ErrPlayerIDRequired         = errors.New("playerID 必須為正整數")
+	ErrInvalidUnfreezeAmount    = errors.New("解凍金額不可為負")
+	ErrUnfreezeNotAllowed       = errors.New("只有 CREDIT 可以解凍")
 )
 
 // DirectionOf 回傳子類型所屬的主類型。第二個回傳值為 false 代表子類型未知。
@@ -126,6 +128,7 @@ type Movement struct {
 	Type           TxType
 	SubType        SubType
 	Amount         Amount
+	UnfreezeAmount Amount // 選填、**僅 CREDIT 可非零**：要釋放的凍結金額
 	IdempotencyKey string
 	ReferenceID    string // 選填：roundID / eventID，供事後對帳
 }
@@ -139,16 +142,26 @@ func NewDebit(playerID int64, amount Amount, subType SubType, idempotencyKey, re
 	if subType == "" {
 		subType = SubTypeBet
 	}
-	return newMovement(playerID, TxTypeDebit, subType, amount, idempotencyKey, referenceID)
+	// unfreeze 恆為 0：Java 的 DebitRequest 根本沒有這個欄位，凍結是 credit 端的事。
+	return newMovement(playerID, TxTypeDebit, subType, amount, 0, idempotencyKey, referenceID)
 }
 
 // NewCredit 建立一次已驗證的入帳意圖。subType 為必填——入帳來源太多元
 // （中獎、簽到、任務、GM 補發…），沒有一個「合理的預設」。
-func NewCredit(playerID int64, amount Amount, subType SubType, idempotencyKey, referenceID string) (Movement, error) {
-	return newMovement(playerID, TxTypeCredit, subType, amount, idempotencyKey, referenceID)
+//
+// unfreeze 是選填的解凍金額（對齊 Java `CreditRequest.unfreezeAmount`，
+// `@PositiveOrZero`），用於「下注時先凍結、結算時解凍」的流程。
+// ⚠️ 傳 0 是正常值不是錯誤——Java 的註解明說目前多半傳 0 或不傳。
+//
+// ⚠️ 這裡**不擋** unfreeze > 目前凍結金額。Java 的做法是在服務層
+// `max(0, frozen - unfreeze)` 夾住並 log.warn（WalletService.java:196-200），
+// 不是拒絕請求。要擋也擋不了——真正的凍結金額只有 DB 那一刻才知道，
+// 在這裡比對等於拿一個過期的值做決定。
+func NewCredit(playerID int64, amount Amount, subType SubType, idempotencyKey, referenceID string, unfreeze Amount) (Movement, error) {
+	return newMovement(playerID, TxTypeCredit, subType, amount, unfreeze, idempotencyKey, referenceID)
 }
 
-func newMovement(playerID int64, txType TxType, subType SubType, amount Amount, idempotencyKey, referenceID string) (Movement, error) {
+func newMovement(playerID int64, txType TxType, subType SubType, amount, unfreeze Amount, idempotencyKey, referenceID string) (Movement, error) {
 	if playerID <= 0 {
 		return Movement{}, fmt.Errorf("%w: 得到 %d", ErrPlayerIDRequired, playerID)
 	}
@@ -167,6 +180,18 @@ func newMovement(playerID int64, txType TxType, subType SubType, amount Amount, 
 	if want != txType {
 		return Movement{}, fmt.Errorf("%w: %q 屬於 %s，不能用在 %s", ErrSubTypeDirectionMismatch, subType, want, txType)
 	}
+	// 對齊 Java 的 @PositiveOrZero：0 合法、負數不合法。
+	// ⚠️ 負的 unfreeze 會讓 store 那層的 frozen_amount **變大**，
+	// 於是可用餘額（balance - frozen_amount）憑空變小，症狀是後續下注拿到
+	// 「餘額不足」而餘額看起來明明夠。schema 的 CHECK 只擋負數，擋不住這個方向。
+	if unfreeze < 0 {
+		return Movement{}, fmt.Errorf("%w: 得到 %d", ErrInvalidUnfreezeAmount, unfreeze)
+	}
+	// 走公開建構子時不可能觸發（NewDebit 硬編 0），但 Movement 是可以手動組出來的
+	// struct。把不變式寫在這裡，它才有一個看得見、測得到的位置。
+	if unfreeze != 0 && txType != TxTypeCredit {
+		return Movement{}, fmt.Errorf("%w: %s 帶了 unfreeze=%d", ErrUnfreezeNotAllowed, txType, unfreeze)
+	}
 	if err := validateIdempotencyKey(idempotencyKey); err != nil {
 		return Movement{}, err
 	}
@@ -175,6 +200,7 @@ func newMovement(playerID int64, txType TxType, subType SubType, amount Amount, 
 		Type:           txType,
 		SubType:        subType,
 		Amount:         amount,
+		UnfreezeAmount: unfreeze,
 		IdempotencyKey: idempotencyKey,
 		ReferenceID:    referenceID,
 	}, nil

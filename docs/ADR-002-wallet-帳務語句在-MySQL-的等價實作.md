@@ -173,6 +173,79 @@ PG 也沒有 gap lock。沿用 MySQL 的 RR 預設不是「保守」，是憑空
 在 MySQL 上它是**常態**。淨額、流水數、事件數都正確，
 但 `version` 因此**不是**「餘額變動次數」（每個回沖的 loser 讓它 +2）。
 
+### 7. ⭐ credit 保留「讀改寫 + 樂觀鎖」，並自己補上補償 —— 2026-08-02 補充
+
+> **補充於實作 `Repository.Credit` 時。** 前面六條都在講 debit；這一條處理的是
+> 「同一份 ADR 的判準套到一個**形狀不同**的方法上會怎樣」。
+
+團隊只對 debit 做過 T-090 B2 那次「壓成一條語句」的改寫。credit 到現在仍是
+JPA 的讀改寫 + `@Version`（`WalletService.java:168-260`）：
+
+```
+往返 1  以冪等鍵查流水（快路徑）
+往返 2  findById 載入錢包
+往返 3  save() → UPDATE ... WHERE version = ?   ← 0 列 = 409
+往返 4  INSERT 流水 → 唯一鍵衝突 → 回查贏家
+outbox  wallet.credit 進 wallet_outbox（同一交易）
+```
+
+**決策 7a：不把 credit 也壓成條件 UPDATE。**
+
+技術上做得到，而且會快。**但那會刪掉一個對外行為**：樂觀鎖衝突（HTTP 409）
+從此不再發生。這份 ADR 的整個前提是等價，而等價的對象是**可觀察的行為**，
+不是語句數。要改的話得先讓契約測試涵蓋它，再進藍圖 §5 當成刻意的改進。
+
+代價誠實記錄，且**已量測**（`TestCreditConcurrentSamePlayer`）：
+
+| | debit（條件 UPDATE） | credit（讀改寫 + 樂觀鎖） |
+|---|---|---|
+| 20 筆同玩家不同鍵併發 | 20 筆全成功 | **成功 1、409 十九筆** |
+| 熱路徑往返數 | 3（+outbox） | 4（+outbox） |
+
+N 個交易同時讀到 `version = v`，只有一個 UPDATE 得逞。**PostgreSQL 的 EPQ
+行為相同**，所以這是 Java 版的既有行為，不是 MySQL 引入的。
+→ 已收進 `AGENTS.md` 地雷 #36。
+
+**決策 7b：`RowsAffected == 0` 必須自己檢查。**
+
+Java 的 `@Version` 讓 JPA 自動比對受影響列數並丟
+`ObjectOptimisticLockingFailureException`。**Go 沒有這個魔法**——GORM 執行同樣的
+UPDATE，但 0 列時**不回傳 error**（地雷 #3）。少了那個 switch，一次被蓋掉的更新
+會被當成成功，然後照樣寫流水、發事件：流水說加了錢、餘額說沒有。
+
+決策 1 那條註記在這裡第二次派上用場：`version = version + 1` 讓「有匹配」必然
+「有異動」，所以 `RowsAffected == 0` 只有一種解讀。
+
+**決策 7c：⭐ 1062 之後必須補償——這一條推翻了決策 4 的樂觀語氣。**
+
+決策 4 說「MySQL 的重複鍵不中止交易，這一條比原版簡單」。**用在 credit 上，
+它反而更危險**：
+
+Java 的 catch（`:220-233`）在 PostgreSQL 上其實**回不了正常值**——PG 的約束違反讓
+整筆交易 aborted，catch 裡那句回查自己也會炸，結局是交易回滾、餘額沒多加。
+**Java 是被 PG 的語義意外保護的**（實際結局是 500）。
+⚠️ `WalletTransaction` 用 `GenerationType.IDENTITY`，`save()` 會立刻送出 INSERT，
+所以例外確實落在 try 區塊內——這是判斷結局的依據，不是推測。
+
+MySQL 少了這層保護，逐行照抄的結果是**餘額加了、流水沒寫、正常 commit**：
+重複入帳，零錯誤訊息。所以 Go 版必須自己寫 `compensateCredit`，與 debit 對稱。
+
+⚠️ 回沖加回的是**實際解凍量**而不是請求值——Java 的 `max(0, frozen - unfreeze)`
+會夾住超額請求，兩者可能不同。加回請求值會讓 `frozen_amount` 憑空長大，
+於是可用餘額變小、之後的下注拿到**假的餘額不足**。
+→ 已收進 `AGENTS.md` 地雷 #35。
+
+**決策 7d：credit 同樣明寫 READ COMMITTED，但理由只有一半。**
+
+- 地雷 #34（gap lock 死鎖）**不適用**：那個死鎖來自條件 UPDATE 的 `NOT EXISTS`
+  子查詢，credit 沒有它，往返 1 是普通的一致性讀、在 RR 下不上任何鎖。
+- 地雷 #32（RR 快照）**適用，換了個入口**：往返 1 就是這筆交易的第一次一致性讀，
+  快照在那裡固定 → 往返 2 讀到的 version 可能是舊的 → 往返 3 的鎖定讀看最新值
+  → `WHERE version = ?` 恆不成立 → **憑空多出一批 Java 版不會有的 409**。
+
+同一個結論、不同的推導，所以 `debitTxOptions` 與 `creditTxOptions` 刻意是
+**兩個變數**：隔離級別是 per-transaction 的決定，合併成一個會讓「改一個等於改兩個」。
+
 ---
 
 ## 這些主張怎麼被證明
@@ -199,6 +272,23 @@ PG 也沒有 gap lock。沿用 MySQL 的 RR 預設不是「保守」，是憑空
 | `TestDebitConcurrentSamePlayer` | ⭐ 20 goroutine 搶 1000 元：恰好 10 成功、餘額歸零 |
 | `TestDebitConcurrentSameKey` | ⭐ 同一把鍵併發：只扣一次、一筆流水、一則事件 |
 | `TestIsolationLevelDecidesWinnerVisibility` | 決策 6 的②，RR / RC 各跑一次 |
+
+`repository_credit_infra_test.go`（2026-08-02 新增）驗決策 7：
+
+| 測試 | 釘住的主張 |
+|---|---|
+| `TestCredit`（5 格表格） | 正常入帳／餘額 0 也能入（沒有餘額守衛）／解凍／解凍超額夾到 0 並留痕／錢包不存在零副作用 |
+| `TestCreditIsIdempotent` | 重送不再加錢、不再發事件，且 `FrozenAfter == nil`（對齊 Java 的 null） |
+| `TestCreditWritesOutboxPayload` | topic 是 `wallet.credit`（事件），payload 逐位元組對齊 Java |
+| `TestCreditOptimisticLockConflict` | ⭐ 決策 7b：`RowsAffected == 0` → 409 且**零副作用** |
+| `TestCreditDupEntryDoesNotDoubleCredit` | ⭐⭐ 決策 7c：拿掉補償就會紅在「balance = 2000, want 1500」 |
+| `TestCreditConcurrentSameKey` | 同鍵併發：只加一次、一筆流水、一則事件 |
+| `TestCreditConcurrentSamePlayer` | ⭐ 決策 7a 的量測：成功 1／409 十九筆，且 version 恰好等於成功筆數 |
+
+⚠️ `TestCreditDupEntryDoesNotDoubleCredit` **手工重演**往返 2~4 而不是呼叫
+`Credit()`：要打中的窗口在往返 1 與往返 2 之間，而兩者都是非鎖定讀，
+**沒有辦法用行鎖把執行緒卡在它們中間**。換來的是 100% 決定性，
+而被測的補償邏輯（`compensateCredit`）是正式路徑那一份。
 
 ⚠️ 這些看起來像「在測資料庫而不是測自己的程式」。**是刻意的**：
 它們是這份 ADR 的立論基礎，哪天 MySQL 升版行為變了，
