@@ -123,8 +123,55 @@ InnoDB 的重複鍵錯誤只是**語句級**失敗，交易仍然可用。
 ### 5. 帳務表的字串欄位一律 `COLLATE utf8mb4_bin`
 
 見 `AGENTS.md` 地雷 #30。這一條不在原本的預期內，是實作時實測發現的，
-**也是這份 ADR 最有價值的一段**——因為它是「換資料庫」這件事裡
-唯一一個**兩邊都不會報錯**的差異。
+因為它是「換資料庫」這件事裡一個**兩邊都不會報錯**的差異。
+
+### 6. ⭐ 扣款交易明寫 `READ COMMITTED` —— 2026-08-01 補充
+
+> **補充於實作 `Repository.Debit` 時**，原始版本沒有這一節。
+> 它推翻了一個沒寫下來的隱含假設：「隔離級別用預設的就好」。
+
+決策 1 的條件 UPDATE 在 MySQL 的預設隔離級別（REPEATABLE READ）下**無法運作**。
+兩個獨立的失敗模式，都是 PostgreSQL 上不存在的：
+
+**① gap lock 死鎖（地雷 #34）**
+
+`NOT EXISTS (SELECT 1 FROM wallet_transactions WHERE idempotency_key = ?)`
+在鍵不存在時，會對唯一索引的 supremum 下 **S 型 gap lock**。
+另一個已持有 `wallets` 行 X 鎖的交易要 INSERT 同一個 gap，需要
+**insert intention lock**——兩者互斥，於是循環等待。
+
+⚠️ **不同的冪等鍵也會撞**：索引還小的時候，所有不存在的鍵都落在同一個
+supremum gap 裡。實測 20 筆同玩家併發下注（每筆不同鍵）**19 筆 1213**。
+真因取自 `SHOW ENGINE INNODB STATUS` 的 `LATEST DETECTED DEADLOCK`，
+兩邊持有／等待的鎖清清楚楚，不是推測。
+
+**② RR 的快照讓補償路徑回查不到贏家（地雷 #32）**
+
+RR 的快照在交易的**第一次一致性讀**（決策 1 的點查餘額）就固定；
+贏家是在那之後才提交的 → 普通 SELECT 看不到它 → 誤判成
+「衝突了卻找不到贏家」，而決策 2 的補償路徑正好依賴這次回查。
+
+**決策**：`sql.TxOptions{Isolation: sql.LevelReadCommitted}`，只設在扣款交易上。
+
+**這不是效能調校，是等價**。這份 ADR 的整個前提是「Java 版跑在 PostgreSQL 上，
+我們要在 MySQL 上做出等價的東西」——而 **PG 的預設隔離級別就是 READ COMMITTED**，
+PG 也沒有 gap lock。沿用 MySQL 的 RR 預設不是「保守」，是憑空引入兩個
+原版不存在的失敗模式。
+
+**為什麼不改全域或連線預設**：偷偷改掉全域之後，後來的人完全看不出哪裡變了，
+而隔離級別會影響**每一條**查詢的語義。放在交易的選項上，理由就寫在使用它的地方。
+
+**為什麼不靠死鎖重試就好**：19/20 的死鎖率下，重試是在遮蓋病灶而不是治它，
+而且每次重試都是一整筆交易白做。重試仍然保留（`maxDeadlockRetries = 3`）
+但定位是**縱深防禦**——鎖順序會隨資料分布與執行計畫改變，
+「不可能死鎖」在 MySQL 上不是能保證的事。
+⚠️ 重試安全的前提是**冪等鍵不變**（地雷 #4），且只重試 1213 / 1205。
+
+**RC 帶來的行為差異（不是錯誤，但要知道）**：同鍵併發時後到者走的是
+**補償回沖路徑**而不是冷路徑——RC 的快照是 per-statement 的，後到者在被行鎖
+擋住之前就取好了快照。Java 版在 PG 上稱這條路徑為「極窄競態」，
+在 MySQL 上它是**常態**。淨額、流水數、事件數都正確，
+但 `version` 因此**不是**「餘額變動次數」（每個回沖的 loser 讓它 +2）。
 
 ---
 
@@ -140,6 +187,18 @@ InnoDB 的重複鍵錯誤只是**語句級**失敗，交易仍然可用。
 | `TestSubTypeCheckIsCaseSensitive` | 決策 5 的第二個方向 |
 | `TestConditionalDebit` | 決策 1：足額扣款 / 餘額不足零副作用 / 冪等命中零副作用 |
 | `TestDupEntryDoesNotAbortTransaction` | 決策 4 |
+
+`repository_infra_test.go`（2026-08-01 新增）再往上驗一層——決策 1~3 組起來
+之後**整條扣款路徑**的行為：
+
+| 測試 | 釘住的主張 |
+|---|---|
+| `TestDebit`（5 格表格） | 四種結局，含餘額不足與錢包不存在的**零副作用** |
+| `TestDebitIsIdempotent` | 重送不再扣款、不再寫流水、**不再發一次事件** |
+| `TestDebitWritesOutboxPayload` | 決策 3 的 id 真的填回來了，payload 逐位元組對齊 Java |
+| `TestDebitConcurrentSamePlayer` | ⭐ 20 goroutine 搶 1000 元：恰好 10 成功、餘額歸零 |
+| `TestDebitConcurrentSameKey` | ⭐ 同一把鍵併發：只扣一次、一筆流水、一則事件 |
+| `TestIsolationLevelDecidesWinnerVisibility` | 決策 6 的②，RR / RC 各跑一次 |
 
 ⚠️ 這些看起來像「在測資料庫而不是測自己的程式」。**是刻意的**：
 它們是這份 ADR 的立論基礎，哪天 MySQL 升版行為變了，

@@ -267,6 +267,69 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     - ⚠️ 這也是否決 golang-migrate 的主因：它失敗會把版本表標成 dirty
       並拒絕後續執行，而在 MySQL 上 dirty 是**常態**不是意外。
 
+32. **⭐ MySQL 的 REPEATABLE READ 快照會讓「回查剛提交的那一列」失敗**：
+    MySQL 預設隔離級別是 **REPEATABLE READ**，交易的快照在**第一次一致性讀**
+    固定，之後別人提交的列一律看不到。PostgreSQL 預設 **READ COMMITTED**，
+    每條語句重取快照——所以團隊 Java 版從來沒遇過這件事。
+    踩到的位置是 wallet debit 的併發同鍵補償路徑：
+    ① 條件 UPDATE 扣款 → ② 點查餘額（**這一刻固定快照**）→
+    ③ INSERT 流水撞 1062（代表對手已提交）→ ④ 回查贏家紀錄 → **查不到**。
+    於是「衝突了卻找不到贏家」，整筆交易回滾。
+    解法：回查改用 **locking read**（`SELECT ... FOR SHARE`）——
+    locking read 一律讀最新的已提交版本，行為與 PG 版對齊。
+    ⚠️ 不要改成全域 READ COMMITTED 來解：那會同時改掉所有查詢的語義，
+    而你只需要一條語句讀最新值。
+    ⚠️ 判準：**「先讀過東西、再依賴別人剛提交的結果」的交易一律要當心。**
+    冷路徑（條件 UPDATE 是交易的第一條語句）不受影響——造成 NOT EXISTS
+    不成立的那一列必定在 UPDATE 之前就已提交。
+    由 `internal/wallet/store/repository_infra_test.go` 的
+    `TestRepeatableReadSnapshotHidesCommittedWinner` 釘住。
+
+33. **⭐ Go 的零值 `""` 與 Java 的 `null` 在 JSON 與 SQL 都不是同一個值**：
+    Java 的 `String referenceId` 沒帶時是 `null`，Jackson 預設**會**輸出
+    `"referenceId": null`（本專案的 Java 版沒有設 `NON_NULL`，已確認）。
+    Go 的 `string` 零值是 `""`，會輸出 `"referenceId": ""`；寫進 DB 也是
+    空字串而不是 `NULL`。後果：
+    - 對帳查詢 `WHERE reference_id IS NULL` **一筆都找不到**
+    - 讀端投影進 MongoDB 之後，同一個欄位有的文件是 `null`、有的是 `""`
+    - 契約測試 diff payload 時兩邊不相等，而**沒有任何一層會報錯**
+
+    解法：**選填欄位一律用 `*string` / `*int64`**，並用
+    `domain.OptionalString` 做 `"" → nil` 的轉換（同一個轉換要共用一份，
+    寫兩份必定漂移成「事件裡是 null、DB 裡是空字串」）。
+    ⚠️ 這條適用於**每一個服務**的每一個選填欄位，不只 wallet——
+    Java 的欄位預設可為 null，Go 的預設不行，這個落差在整個重構裡到處都是。
+
+34. **⭐⭐ MySQL 的 gap lock 讓「UPDATE 裡帶 NOT EXISTS 子查詢」在併發下穩定死鎖**：
+    這是 PostgreSQL → MySQL 目前**後果最嚴重**的一條，而且它打在 wallet 的熱路徑上。
+    debit 的條件 UPDATE 帶 `NOT EXISTS (SELECT 1 FROM wallet_transactions
+    WHERE idempotency_key = ?)` 做冪等預檢。鍵不存在時，InnoDB 會對唯一索引的
+    **supremum 下 S 型 gap lock**；另一個已持有 `wallets` 行 X 鎖的交易要 INSERT
+    同一個 gap，需要 **insert intention lock**，兩者互斥 → 循環等待。
+    ⚠️ **不同的冪等鍵也會撞**：索引還小的時候，所有不存在的鍵都落在**同一個
+    supremum gap**。實測 20 筆同玩家併發下注（每筆不同鍵）**19 筆 1213**。
+    PostgreSQL 沒有 gap lock，所以團隊 Java 版結構上不可能踩到。
+
+    **解法：把扣款交易明寫成 READ COMMITTED**（`sql.TxOptions{Isolation:
+    sql.LevelReadCommitted}`，見 `internal/wallet/store.debitTxOptions`）。
+    RC 不對搜尋下 gap lock，環就斷了。⚠️ 這不是效能調校，是**等價**——
+    Java 版跑在 PostgreSQL 上，而 PG 的預設就是 RC；沿用 MySQL 的 RR 預設
+    等於憑空引入兩個原版不存在的失敗模式（另一個是地雷 #32）。
+    ⚠️ **只設在該筆交易上，不要改全域或連線預設**：偷偷改掉全域，後來的人
+    完全看不出哪裡變了。
+
+    **RC 帶來的行為差異（必須知道，但不是錯誤）**：同鍵併發時後到者走的是
+    **補償回沖路徑**而不是冷路徑——RC 的快照是 per-statement 的，後到者在被
+    行鎖擋住之前就取好了快照，那裡面還沒有贏家的流水。Java 版在 PG 上把這條
+    路徑稱為「極窄競態」，在 MySQL 上它是**常態**。
+    淨額、流水數、事件數都正確，但 **`version` 不是「餘額變動次數」**：
+    每個回沖的 loser 會讓它 +2。拿 version 當計數器會得到錯的答案。
+
+    **另外仍要保留死鎖重試**（`maxDeadlockRetries`）：RC 之後 debit 不再死鎖，
+    但鎖順序會隨資料分布與執行計畫改變，「不可能死鎖」在 MySQL 上不是能保證的事。
+    ⚠️ 重試安全的前提是**冪等鍵不變**（地雷 #4）——換鍵重試就是重複扣款。
+    ⚠️ 只重試 1213 / 1205。1062 重試一萬次還是 1062，而餘額已經被扣掉了。
+
 ---
 
 ## 3. 約定速查

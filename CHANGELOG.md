@@ -5,6 +5,114 @@
 
 ---
 
+## [feat] — 2026-08-01 — wallet debit 熱路徑：條件扣款 + 冪等 + Outbox 同交易
+
+Phase A 的第二個切片，也是**第一段真的會動到餘額的程式碼**。
+`docs/ADR-002` 的三條語句從文件變成實作，並由 infra 測試逐條釘住。
+credit 尚未實作，HTTP 層與 outbox poller 也還沒有。
+
+**Added**
+
+- **`internal/wallet/store.Repository.Debit`——扣款熱路徑**。
+  逐步對齊 Java 的 `WalletService.debit`（66-126，已逐行讀過原始碼）：
+  條件 UPDATE → 點查餘額 → 寫流水 → 寫 outbox，全部在**同一筆交易**裡。
+  冷路徑的判斷順序（冪等命中 → 錢包不存在 → 餘額不足）不可調換：
+  把「餘額不足」排前面的話，重送一筆錢已經花光的舊請求會拿到 400 而不是原結果。
+- **`internal/wallet/domain.DebitEvent`——`wallet.debit` 的事件契約**。
+  逐欄位、**逐順序**對齊 Java 的 record，因為 outbox 存的是原始 JSON 字串，
+  契約測試會直接 diff 它。有單元測試釘住輸出的位元組。
+- **`domain.OptionalString`**——`"" → nil` 的共用轉換（地雷 #33）。
+- **地雷 #32 / #33 / #34**（見下）。
+
+**Changed**
+
+- **`isDupEntry` 與 1062 從測試檔搬進 `repository.go`**：正式路徑同樣要辨識
+  重複鍵，留在測試檔會變成兩份定義。順帶補上 1213 / 1205 兩個**會回滾整筆交易**
+  的錯誤碼——`docs/ADR-002` 決策 4 說「認錯誤碼必須精確」，這是它的實作面。
+- **`TestConditionalDebit` 改用 `repository.go` 裡的 SQL 常數**，不再自己抄一份。
+  測試抄一份 SQL 的話，改壞了實作它照樣綠。
+
+**⭐ 地雷 #34：MySQL 的 gap lock 讓熱路徑在併發下穩定死鎖**
+
+本輪**最重要**的發現，而且完全不在預期內——`docs/ADR-002` 寫完的時候沒有人想到它。
+
+debit 的條件 UPDATE 帶 `NOT EXISTS (... idempotency_key = ?)` 做冪等預檢。
+鍵不存在時 InnoDB 對唯一索引的 supremum 下 **S 型 gap lock**；另一個已持有
+`wallets` 行 X 鎖的交易要 INSERT 同一個 gap，需要 **insert intention lock**，
+兩者互斥 → 循環等待。⚠️ **不同的冪等鍵也會撞**，因為索引還小的時候所有不存在的
+鍵都落在同一個 supremum gap。
+
+**實測：20 筆同玩家併發下注（每筆不同鍵），19 筆 `Error 1213`。**
+不是邊角案例，是「兩個人同時下注就掛」。真因由 `SHOW ENGINE INNODB STATUS` 的
+`LATEST DETECTED DEADLOCK` 確認，不是推測——報告裡兩邊持有／等待的鎖清清楚楚。
+
+解法是把扣款交易明寫成 **READ COMMITTED**。這不是效能調校，是**等價**：
+Java 版跑在 PostgreSQL 上，而 PG 的預設就是 RC，PG 也沒有 gap lock。
+沿用 MySQL 的 RR 預設等於憑空引入兩個原版不存在的失敗模式。
+⚠️ 只設在該筆交易上，不動全域也不動連線預設。
+
+**⭐ 地雷 #32：RR 的快照讓補償路徑回查不到剛提交的贏家**
+
+同一個隔離級別決策的第二個理由。RR 的快照在**第一次一致性讀**（點查餘額）
+就固定，而贏家是在那之後才提交的 → 普通 SELECT 看不到它 → 誤判成
+「衝突了卻找不到贏家」。PG 的 RC 每條語句重取快照，所以 Java 版沒這問題。
+`TestIsolationLevelDecidesWinnerVisibility` 用**兩個隔離級別各跑一次**釘住這件事，
+它就是選 RC 的證據。
+
+**⭐ 地雷 #33：Go 的 `""` 與 Java 的 `null` 在 JSON 與 SQL 都不是同一個值**
+
+Jackson 預設會輸出 `"referenceId": null`（已確認本專案的 Java 版沒設 `NON_NULL`）；
+Go 的 string 零值會輸出 `""`，寫進 DB 也是空字串而不是 NULL。
+後果是對帳查詢 `WHERE reference_id IS NULL` 一筆都找不到、讀端投影出兩種空值，
+而**沒有任何一層會報錯**。解法是選填欄位一律用指標 + 共用一份轉換函式。
+⚠️ 這條適用於**每一個服務**的每一個選填欄位，不只 wallet。
+
+**如何驗證**
+
+```
+gofmt -l .                                # 無輸出
+go vet -tags=infra ./...                  # OK
+go build ./...                            # OK
+golangci-lint run                         # 0 issues
+golangci-lint run --build-tags=infra      # 0 issues
+go test -race -count=1 ./...              # 全綠
+go test -race -tags=infra -count=1 ./...  # 6 個套件全綠（wallet/store 19.4s）
+```
+
+`-tags=infra` 那組實際連上 MySQL 8.4.10，**每個測試在自己的臨時資料庫上跑**
+（併發測試要斷言「總共只有 N 筆流水」，共用的庫裡有別人的資料就驗不了）：
+
+| 測試 | 釘住的主張 |
+|---|---|
+| `TestDebit`（5 格表格） | 成功 / 剛好扣到零 / 商城子類型 / 餘額不足**零副作用** / 錢包不存在 |
+| `TestDebitIsIdempotent` | 重送不再扣款、不再寫流水、**不再發一次事件** |
+| `TestDebitIdempotencyKeyIsCaseSensitive` | 地雷 #30 在應用層的表現 |
+| `TestDebitCrossPlayerIdempotencyCollision` | 回原交易值 + ERROR 級留痕（刻意保留的怪行為） |
+| `TestDebitWritesOutboxPayload` | topic / kafka_key / PENDING / payload **逐位元組** |
+| `TestDebitEmptyReferenceIDBecomesNull` | 地雷 #33 |
+| `TestDebitConcurrentSamePlayer` | ⭐ 20 goroutine 搶 1000 元：**恰好** 10 成功、餘額歸零、流水與事件各 10 |
+| `TestDebitConcurrentSameKey` | ⭐ 10 goroutine 同一把鍵：只扣一次、一筆流水、一則事件 |
+| `TestIsolationLevelDecidesWinnerVisibility` | 地雷 #32，RR/RC 各跑一次 |
+
+**誠實記錄的負面後果**
+
+- **`version` 不是「餘額變動次數」**。RC 之下同鍵併發走的是補償回沖路徑，
+  每個 loser 讓 version +2。淨額、流水數、事件數都正確，但拿 version 當計數器
+  會得到錯的答案。Java 版的 `restoreBalance` 同樣 +1，差別只在頻率——
+  在 PG 上是「極窄競態」，在 MySQL 上是常態。
+- **`db.Debug()` 尚未接上**：藍圖 §3.2 要求帳務熱路徑看得見 SQL，
+  但目前還沒有 `cmd/wallet`，沒有地方接。`NewRepository` 的文件已寫明
+  「傳進來的 db 應該已掛好 SQL logger」，實際接線留到 main 出現時。
+- **`ErrTransactionBalanceMissing` 與 Java 不同**：Java 的 `DebitResponse`
+  欄位是 `Long`，冪等命中時會把 null 原樣回出去；Go 這邊改成明確報錯。
+  理由是回 0 是靜默的錯誤數字，而把整條鏈路改成指標，是為一個
+  「所有 Java 寫入路徑都會設值」的狀態永久付出成本。**這是刻意的分歧**，
+  等契約測試建起來要再確認一次。
+- 🔶 **credit 尚未實作**，`domain.NewCredit` 目前只有驗證、沒有落庫路徑。
+- 🔶 **outbox poller 與清理排程仍未實作**（地雷 #5），掛在 Phase A 待辦。
+
+---
+
 ## [chore] — 2026-08-01 — schema migration 改由 goose 管理，並清掉既有 lint
 
 結掉 `docs/ADR-002` 的待辦（migration 工具未選定），順手把既有的 lint 問題清乾淨。
