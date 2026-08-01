@@ -193,10 +193,10 @@ credit subType=BET            400 Invalid request: subType subType must be one o
 - 🔶 **`/healthz` 不是 Java 契約的一部分**。Java 走 Spring Actuator 的
   `/actuator/health`，這裡刻意不模仿那個 JSON 形狀——為了一個探針把 Actuator
   的結構搬過來，是把 Spring 的實作細節當成契約。探針路徑由部署設定，不由契約決定。
-- ⚠️ **`golangci-lint --build-tags=infra` 有 1 個既有問題**：
-  `repository_credit_infra_test.go:48` 的 `mustCredit` 從來沒被呼叫過。
-  它在 develop 上就存在（本輪沒動到那個檔）。依 CLAUDE.md §3
-  「發現不相關的死碼**告訴我**，不要擅自刪除」，**留著並記在這裡**。
+- **順手刪掉一個既有的死碼**：`repository_credit_infra_test.go` 的 `mustCredit`
+  從來沒被呼叫過（credit 那一輪留下的，`golangci-lint --build-tags=infra` 唯一的
+  issue）。依 CLAUDE.md §3 先回報再刪，且獨立成一個 `chore` commit——
+  它不是本切片的一部分，混進同一個 commit 會讓「這一輪改了什麼」失焦。
 - **SQL log 預設開著**（`WALLET_SQL_LOG=true`）是刻意的取捨：帳務要看得見 SQL
   （藍圖 §3.2），代價是每筆請求多 3~5 行日誌。壓測時要記得關掉，
   否則量到的會是 log I/O 而不是帳務路徑。
