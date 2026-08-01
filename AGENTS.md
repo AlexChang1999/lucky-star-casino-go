@@ -448,10 +448,26 @@ test/load/            Go 自寫壓測 client
   - `main` —— 穩定版
   - `develop` —— 整合分支，**PR 一律進這裡**
   - `feat/*` `fix/*` `chore/*` —— 工作分支，完成後開 PR 進 `develop`
+- ⭐ **每個新切片一律從最新的 `develop` 開新分支，不准接在已合併的舊分支後面**：
+
+  ```bash
+  git checkout develop && git pull && git checkout -b feat/<新切片>
+  ```
+
+  2026-08-02 踩過一次：credit 直接接在已合併的 `feat/wallet-debit` 後面繼續做，
+  症狀有兩個——**分支名與內容對不上**（那條分支最後裝了 debit 與 credit 兩批
+  已合併的工作），以及**開 PR 前用本機過期的 `origin/develop` ref 誤判了 PR 範圍**，
+  於是 PR 標題寫成「debit + credit」而實際只含 credit，事後才更正。
+  ⚠️ `git log origin/develop..HEAD` 讀的是**本機快取的 ref**。
+  判斷「我到底領先 develop 幾個 commit」之前一定要先 `git fetch`，
+  否則會拿到一個看起來很有說服力的錯答案。
 - commit 格式：`type(scope): 中文描述`
   例：`feat(wallet): 冪等鍵改走 UNIQUE 衝突而非先查後寫`
 - scope 用服務或套件名：`wallet` / `gateway` / `game` / `member` / `rank` /
   `admin` / `notify` / `platform` / `deploy` / `docs`
+- **一個 PR 一個切片**。切片的粒度是「能獨立說清楚一件事」——
+  debit 是一個、credit 是一個。合在一起不會比較快，只會讓 review 與
+  CHANGELOG 都失焦。
 
 ### CHANGELOG / ADR
 
