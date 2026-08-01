@@ -1,0 +1,42 @@
+# 一律以 LF 存進 repo、也以 LF 簽出。
+#
+# 為什麼需要這個檔：Windows 的 git 預設 core.autocrlf=true，clone 下來會把
+# 檔案轉成 CRLF。而本專案的驗證是在 Linux 容器裡跑的，gofmt 只認 LF——
+# 結果就是「明明沒改東西，gofmt -l 卻把每個檔案都列出來」。
+# 這種假警報會浪費一整輪除錯。（沿用 lucky-star-notify-go 的設定。）
+*.go     text eol=lf
+go.mod   text eol=lf
+go.sum   text eol=lf
+
+*.md     text eol=lf
+*.yml    text eol=lf
+# 這兩個檔本身也要 LF——不列的話 git 會對它們套用 core.autocrlf，
+# 然後在每次 `git add` 噴 "LF will be replaced by CRLF" 的警告。
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+*.yaml   text eol=lf
+*.sh     text eol=lf
+*.sql    text eol=lf
+Dockerfile     text eol=lf
+.dockerignore  text eol=lf
+
+# ⚠️ .env 一定要 LF。docker compose 讀 .env 時，CRLF 會讓每個值都夾帶一個
+# 尾端 \r——於是密碼變成「密碼加一個看不見的字元」，連線永遠失敗，
+# 而訊息只會說 authentication failed，完全指不到真因。
+.env.example   text eol=lf
+
+*.json   text eol=lf
+*.js     text eol=lf
+*.html   text eol=lf
+
+# Lua 腳本是從團隊 repo 原樣搬過來的資產（捕魚 session 的 CAS，見藍圖 §6.1
+# 的 ADR-008）。行尾被改動不影響 Redis 執行，但會讓 diff 對照不出來。
+*.lua    text eol=lf
+
+# 二進位檔不要做任何行尾轉換
+*.png binary
+*.jpg binary
+*.gif binary
+
+# patch 檔一律**不要**做行尾轉換（成因見 lucky-star-notify-go 的地雷 §2.21）。
+*.patch -text

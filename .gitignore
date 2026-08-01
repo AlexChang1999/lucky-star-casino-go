@@ -1,0 +1,38 @@
+# 編譯產物
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 測試與覆蓋率
+*.test
+coverage.out
+coverage.html
+
+# 效能剖析輸出（pprof，藍圖 §3.4）
+*.prof
+*.pprof
+
+# 環境設定：.env.example 進版控，實際的 .env 永遠不進
+.env
+.env.local
+deploy/.env
+
+# 編輯器
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 依賴（Node.js 契約測試用）
+node_modules/
+
+# ⚠️ 模糊測試找到的失敗案例會被寫進 testdata/fuzz/。
+# 有價值的案例要「手動」搬進版控當回歸案例，所以這裡只忽略自動產生的暫存語料，
+# 不要整個 testdata/ 都忽略掉。
+testdata/fuzz/*/[0-9a-f]*
