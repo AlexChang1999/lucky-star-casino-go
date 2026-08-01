@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -90,6 +91,40 @@ type Infra struct {
 	MySQL MySQL
 	Mongo Mongo
 	Redis Redis
+}
+
+// Kafka 是事件匯流排的連線設定。
+//
+// ⚠️ 它**不放進 Infra**，理由與 LoadMySQL 從 LoadInfra 拆出來完全相同：
+// `cmd/migrate` 一輩子不會碰 Kafka，讓它因為 KAFKA_BOOTSTRAP_SERVERS 打錯字
+// 而拒絕啟動，錯誤訊息就指不到真因了。
+type Kafka struct {
+	// Brokers 是 bootstrap 位址清單。多個 broker 時逗號分隔——**這是 bootstrap
+	// 用的種子清單，不是完整叢集清單**：client 連上任一個之後會自己去要
+	// metadata，拿到真正的 broker 位址（那些位址由 advertised.listeners 決定，
+	// 見 compose 檔裡的說明）。
+	Brokers []string
+}
+
+// LoadKafka 載入事件匯流排設定。
+//
+// 預設 localhost:9095 對齊 deploy/.env.example（團隊 repo 是 9092、
+// lucky-star-notify-go 是 9094，三套要能同時跑，地雷 #28）。
+func LoadKafka() (Kafka, error) {
+	raw := stringEnv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9095")
+
+	var brokers []string
+	for _, addr := range strings.Split(raw, ",") {
+		if addr = strings.TrimSpace(addr); addr != "" {
+			brokers = append(brokers, addr)
+		}
+	}
+	if len(brokers) == 0 {
+		// 只有 `KAFKA_BOOTSTRAP_SERVERS=","` 這種值會走到這裡。空字串走預設值，
+		// 但「設了一個解析出來是空的值」是打錯字，不該被靜默當成沒設。
+		return Kafka{}, fmt.Errorf("KAFKA_BOOTSTRAP_SERVERS=%q 解析不出任何位址", raw)
+	}
+	return Kafka{Brokers: brokers}, nil
 }
 
 // LoadMySQL 只載入帳務寫入主庫的設定。
@@ -185,6 +220,24 @@ func intEnv(key string, fallback int) (int, error) {
 	v, err := strconv.Atoi(raw)
 	if err != nil {
 		return 0, fmt.Errorf("%s=%q 不是合法的整數: %w", key, raw, err)
+	}
+	return v, nil
+}
+
+// durationEnv 解析 Go 時距字串（`200ms`、`1s`、`24h`）。
+//
+// ⚠️ 刻意**不接受純數字**。Java 那邊是 `wallet.outbox.poll-interval-ms: 200`，
+// 單位藏在變數名字裡；照搬過來會得到「`WALLET_OUTBOX_POLL_INTERVAL=200`
+// 到底是 200 毫秒還是 200 秒」這種只能靠讀原始碼回答的問題。
+// 帶單位的字串讓值自己說清楚，而 `200` 這種寫法會直接被 time.ParseDuration 擋下。
+func durationEnv(key string, fallback time.Duration) (time.Duration, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("%s=%q 不是合法的時距（例：200ms / 5s / 24h）: %w", key, raw, err)
 	}
 	return v, nil
 }

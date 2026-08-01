@@ -163,7 +163,17 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # topic 由 client 自動建立（wallet 的 writer 帶了 AllowAutoTopicCreation，
+      # 兩邊都要開才成立），省掉一支只會漂移的建 topic 腳本。
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # ⭐ 自動建立的 topic 預設只有 **1 個 partition**，而團隊的 kafka-init.sh
+      # 給高流量 topic（wallet.debit / wallet.credit / wallet.credit.request /
+      # game.result / notification.push）的是 6 個。
+      # ⚠️ 這個值必須在**第一次自動建立之前**就設好：topic 建好之後改 partition 數
+      # 要手動 --alter，而且會改變 key → partition 的對應，等於把既有資料的
+      # 順序保證洗掉。1 個 partition 不會報錯，只會讓「同 group 多開 consumer」
+      # 從第二個開始永遠分不到工作（地雷 #19 的鄰居）。
+      KAFKA_NUM_PARTITIONS: 6
       CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
     ports:
       # 只開 HOST listener；9092 是容器內部通訊，開出去只是多一個沒人用的埠。

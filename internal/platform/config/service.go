@@ -45,6 +45,9 @@ func (h HTTPServer) Addr() string { return fmt.Sprintf(":%d", h.Port) }
 type Wallet struct {
 	HTTP HTTPServer
 
+	// Outbox 是 Transactional Outbox 投遞器與清理排程的參數（AGENTS.md 地雷 #5）。
+	Outbox Outbox
+
 	// InternalSecret 對應 Java 的 `internal.secret`（`InternalSecretFilter`）。
 	// ⚠️ **沒有預設值**，且空字串一律拒絕啟動——空 secret 會讓
 	// `/internal/**` 對全世界敞開，而服務看起來完全正常。
@@ -60,6 +63,33 @@ type Wallet struct {
 	SQLLog bool
 
 	LogLevel slog.Level
+}
+
+// Outbox 是 outbox 投遞器（poller）與保留期清理排程的參數。
+//
+// 三個值全部對齊 Java 版的 `wallet.outbox.*`（`application.yml`），
+// 因為它們是**實測調出來的**，不是隨手填的：poll-interval 從 1000ms 下修到
+// 200ms、batch-size 從寫死的 100 改成可調的 500，都出自團隊 T-090 的遠端壓測
+// （2026-07-23）。照抄一組已經被壓測驗證過的數字，比自己重新猜一組好。
+type Outbox struct {
+	// PollInterval 是**上一輪跑完之後**再等多久跑下一輪（fixed delay），
+	// 不是固定頻率（fixed rate）。理由見 outbox.Poller.Run。
+	PollInterval time.Duration
+
+	// BatchSize 是單輪最多撈幾筆待送事件。
+	//
+	// ⚠️ 它同時是 Kafka writer 的 BatchSize（見 outbox.NewWriter）：
+	// 兩者不一致的話，一輪撈 500 筆卻只有 100 筆能塞進一個 batch，
+	// 剩下的要等下一次 flush——延遲從 10ms 級跳到秒級，而**日誌與指標都看不出來**
+	// （AGENTS.md 地雷 #21 的變形）。
+	BatchSize int
+
+	// Retention 是 SENT 的列保留多久才刪。
+	//
+	// ⚠️ 只刪 SENT，PENDING 無論多舊都不刪（地雷 #5）。7 天與下游去重標記的
+	// TTL 對齊——兩者都對應「最大重送窗口」，保留期短於去重 TTL 會出現
+	// 「事件已刪、去重標記還在」的無法對照狀態。
+	Retention time.Duration
 }
 
 // walletDefaultPort 是本專案 wallet 的對外埠。
@@ -82,8 +112,11 @@ func LoadWallet() (Wallet, error) {
 	errs = append(errs, err)
 	level, err := LoadLogLevel()
 	errs = append(errs, err)
+	outbox, err := loadOutbox()
+	errs = append(errs, err)
 
 	cfg := Wallet{
+		Outbox: outbox,
 		HTTP: HTTPServer{
 			Port: port,
 			// 這五個目前寫死。真正的數字要壓測後才知道（藍圖 §3.4），
@@ -106,6 +139,41 @@ func LoadWallet() (Wallet, error) {
 	}
 
 	return cfg, errors.Join(errs...)
+}
+
+// loadOutbox 讀 outbox 投遞器的三個參數，並擋掉三個「值合法但語義有害」的設定。
+//
+// ⚠️ 這三個檢查不是防禦性程式碼潔癖，它們各自對應一個**不會報錯**的故障：
+//   - PollInterval <= 0 → 迴圈變成忙碌輪詢，把 CPU 與 DB 連線吃光
+//   - BatchSize <= 0 → `LIMIT 0` 永遠撈不到東西，outbox 只進不出而服務一切正常
+//   - Retention <= 0 → 清理排程會刪掉**剛剛才送出去**的列，事故時完全無跡可循
+func loadOutbox() (Outbox, error) {
+	var errs []error
+
+	interval, err := durationEnv("WALLET_OUTBOX_POLL_INTERVAL", 200*time.Millisecond)
+	errs = append(errs, err)
+	batchSize, err := intEnv("WALLET_OUTBOX_BATCH_SIZE", 500)
+	errs = append(errs, err)
+	// 用「天」而不是時距字串，因為保留期本來就是以天在談的
+	// （Java 是 `wallet.outbox.retention-days`），寫 `168h` 只會讓人多算一次。
+	retentionDays, err := intEnv("WALLET_OUTBOX_RETENTION_DAYS", 7)
+	errs = append(errs, err)
+
+	if interval <= 0 {
+		errs = append(errs, fmt.Errorf("WALLET_OUTBOX_POLL_INTERVAL=%s 必須大於 0", interval))
+	}
+	if batchSize <= 0 {
+		errs = append(errs, fmt.Errorf("WALLET_OUTBOX_BATCH_SIZE=%d 必須大於 0——0 會讓 LIMIT 0 永遠撈不到事件", batchSize))
+	}
+	if retentionDays <= 0 {
+		errs = append(errs, fmt.Errorf("WALLET_OUTBOX_RETENTION_DAYS=%d 必須大於 0——0 會刪掉剛送出的事件", retentionDays))
+	}
+
+	return Outbox{
+		PollInterval: interval,
+		BatchSize:    batchSize,
+		Retention:    time.Duration(retentionDays) * 24 * time.Hour,
+	}, errors.Join(errs...)
 }
 
 // LoadLogLevel 解析 LOG_LEVEL（debug / info / warn / error），預設 info。

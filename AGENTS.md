@@ -52,9 +52,11 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 > **A 類（#1–#17）是從團隊 repo 原封不動帶走的**——它們看起來像「Java 專案的事」，
 > 其實是業務與架構本質，換語言一樣會踩。**這一類最容易漏。**
 > **B 類（#18–#25）是前身 Go 專案實際踩過的**，已驗證適用於 Go。
-> **C 類（#26–#36）是本專案新增的**，其中 #30、#32、#34、#35 全部是
+> **C 類（#26–#39）是本專案新增的**，其中 #30、#32、#34、#35、#37 全部是
 > **PostgreSQL → MySQL** 的落差，而且全部**沒有錯誤訊息**——那正是 `docs/ADR-001`
 > 這個決定的真實代價，也是它最有價值的產出。
+> #38、#39 則是另外兩類「照抄會錯」：kafka-go 的預設值與 Spring Kafka 不同、
+> Java 的排程時間寫在**容器本地時區**而本專案一律 UTC。
 > 之後真的踩到新雷，**當場往下加**（§5）。
 
 ### A 類：業務與架構本質（語言無關，必須全部帶走）
@@ -386,6 +388,54 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     而且悄悄重掉會讓呼叫端從此再也看不到 409。
     由 `TestCreditConcurrentSamePlayer` 釘住這個對照。
 
+37. **⭐⭐ outbox poller 的 `FOR UPDATE` 在 RR 之下會擋住帳務的 outbox INSERT**：
+    這是「一個背景排程去卡住帳務熱路徑」，與地雷 #34（debit 自己死鎖）同源但方向不同。
+    撈取語句是 `WHERE status='PENDING' ORDER BY created_at, id LIMIT ? FOR UPDATE SKIP LOCKED`。
+    MySQL 預設的 REPEATABLE READ 對索引範圍下的是 **next-key lock**（列鎖 + 間隙鎖），
+    而 poller **追上進度時**（撈到的筆數 < batchSize，也就是常態）會掃到範圍尾端，
+    間隙一路鎖到 supremum —— 那正是下一筆下注要 INSERT 新 outbox 列的位置。
+    於是帳務交易卡在 insert intention lock 上，**卡多久取決於 Kafka 什麼時候 ack**。
+    ⚠️ 症狀是「下注偶爾變慢」，沒有任何錯誤訊息指向 poller。
+    解法：投遞交易明寫 READ COMMITTED（`internal/wallet/store.outboxTxOptions`），
+    RC 不對搜尋下 gap lock。PostgreSQL 沒有 gap lock，所以團隊 Java 版結構上不會踩到。
+    已於 2026-08-02 對 MySQL 8.4 實測驗證兩個方向，由
+    `TestOutboxClaimIsolationDecidesIfAccountingIsBlocked` 釘住。
+    ⚠️ 附帶一條同樣沒有錯誤訊息的：`FOR UPDATE` 會鎖住**掃到的每一列**，
+    所以撈取語句一旦走上 filesort，`LIMIT 500` 就只限制回傳筆數而鎖蓋在**所有**
+    PENDING 列上。`ORDER BY created_at, id` 之所以不走 filesort，靠的是
+    InnoDB 的 secondary index 隱含帶著主鍵（實際排序是 `status, created_at, id`）——
+    把那個 `, id` 拿掉或換成別的欄位，**查詢結果完全正確**而鎖範圍悄悄變成全表。
+    由 `TestClaimPendingUsesIndexWithoutFilesort` 釘住。
+
+38. **⭐ `kafka-go` 的 Writer 有三個「不設就出事、出事時沒有訊息」的預設值**：
+    地雷 #21 講的是其中一個（`BatchTimeout` 預設 1 秒），另外兩個同樣致命：
+    - **`Async` 預設 false，而它必須維持 false**。改成 true 之後 `WriteMessages`
+      會**立刻回傳 nil**，錯誤只進 `Completion` 回呼——於是 outbox poller 會把
+      「還沒送出、甚至可能永遠送不出」的列標成 SENT，七天後被清理排程刪掉。
+      **事件無聲蒸發，而資料庫說已送出**，正是 Outbox 唯一要防的那件事。
+    - **`Balancer` 預設是 `&Hash{}`（FNV-1a），與 Java 不相容**。Java 的
+      DefaultPartitioner 是 `murmur2(key) % partitions`，kafka-go 對應的是
+      `&Murmur2Balancer{}`。用錯的話同一個 `playerId` 在 Java 版與 Go 版落到
+      **不同 partition**，而重構期間兩版是並存的——同玩家事件橫跨兩個 partition
+      ＝Kafka 唯一的順序保證失效，下游看到的「先扣款後派彩」變成隨機順序。
+      Kafka、producer、consumer 三邊都不會報錯。
+
+    ⚠️ 而 #21 的處方（`BatchSize: 1`）**只適用於低頻單則寫入**。poller 是成批
+    寫入，設成 1 會讓每則訊息各自成一個 batch，而每個 partition 一次只送一個 batch
+    並等 ack —— 那就退化成 Java 舊版 O(N) 循序阻塞（團隊 T-090 壓測發現的瓶頸）。
+    成批寫入的正解是**大 BatchSize + 小 BatchTimeout**。
+    由 `TestNewWriterPinsSilentDefaults` 與 `TestPublisherDoesNotWaitForBatchTimeout`
+    釘住（後者實測單則 12.6ms，預設值會是 1s 起跳）。
+
+39. **⭐ Java 的 `@Scheduled(cron=...)` 跑在容器本地時區，照抄小時數會排到尖峰**：
+    `WalletOutboxPurgeJob` 寫的是 `0 0 4 * * *`，那是 **Asia/Taipei 的凌晨 4 點**
+    （離峰，這是它唯一的排程理由）。本專案一律 UTC（compose 的
+    `--default-time-zone=+00:00`、DSN 的 `loc=UTC`），照抄 4 會變成
+    **台北中午十二點**跑批次刪除——玩家最活躍的時段。
+    ⚠️ 沒有任何錯誤訊息，只會看到「每天中午 DB 有個尖峰」。
+    本專案寫的是 `purgeHourUTC = 20`，由 `TestPurgeHourIsOffPeakInTaipei` 釘住。
+    判準更廣：**從 Java 版搬任何排程時間過來，先問「原本那個數字是哪個時區的」**。
+
 ---
 
 ## 3. 約定速查
@@ -534,7 +584,17 @@ curl -s localhost:8182/healthz
 curl -s -X POST localhost:8182/internal/wallet/debit \
   -H "X-Internal-Secret: $INTERNAL_SECRET" -H 'Content-Type: application/json' \
   -d '{"playerId":1,"amount":100,"idempotencyKey":"bet-1"}'
+
+# 事件在 200ms 內會被 outbox poller 送進 Kafka。⚠️ Git Bash 會把 /opt/... 當成
+# Windows 路徑改寫，所以要 MSYS_NO_PATHCONV=1 + bash -c
+MSYS_NO_PATHCONV=1 docker exec casino-go-kafka bash -c \
+  '/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+     --topic wallet.debit --from-beginning --timeout-ms 4000 --property print.key=true'
 ```
+
+⚠️ **啟動後第一則事件必定有一行 `Unknown Topic Or Partition` 的 ERROR**，
+下一輪就成功。topic 的自動建立是非同步的（metadata 請求觸發建立，那一次 produce
+已經來不及），所以每個 topic 一輩子會出現一次，`retry_count=1` 是正常的。
 
 ⚠️ **玩家的錢包不會被 HTTP 建出來**。Java 版只有 `member.registered` 事件會呼叫
 `WalletService.createWallet`（`MemberEventListener:30`），沒有任何端點做 lazy-create
