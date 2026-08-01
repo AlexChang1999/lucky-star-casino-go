@@ -9,7 +9,7 @@
 
 | 角色 | 職責 | 關鍵限制 | 為什麼需要它 |
 |---|---|---|---|
-| `go-reviewer` | 對照 `AGENTS.md` §2 的 29 條地雷審查 diff，優先看**帳務正確性**與**無聲失敗** | **唯讀**，白名單沒有 Edit/Write | 開 PR 進 `develop` 前的閘門 |
+| `go-reviewer` | 對照 `AGENTS.md` §2 的地雷清單審查 diff，優先看**帳務正確性**與**無聲失敗** | **唯讀**，白名單沒有 Edit/Write | 開 PR 進 `develop` 前的閘門 |
 | `go-tester` | 表格驅動 Go 測試、`test/contract/` 跨語言契約測試、`test/load/` 壓測 | **只碰測試檔**，不改產品碼、不 commit | 契約測試是整個重構的安全網 |
 | `java-reference` | 讀團隊 Java repo，回答「原本到底怎麼做」 | **對團隊 repo 唯讀**，一個位元組都不改 | 重寫專案最貴的錯誤是「發明一個看起來合理的行為」 |
 

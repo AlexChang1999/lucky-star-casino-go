@@ -93,6 +93,11 @@ func OpenRedis(ctx context.Context, cfg config.Redis) (*redis.Client, error) {
 		// 所以不覆蓋——沒有量過就不要調，寫死一個猜的數字比預設更糟。
 	})
 	if err := client.Ping(ctx).Err(); err != nil {
+		// ST1005（error string 不可大寫開頭）在這裡是誤判：那條規則的本意是
+		// 「除非是專有名詞或縮寫」，而 staticcheck 的啟發式只認得**含兩個以上
+		// 大寫字母**的字——所以上面的 MySQL / MongoDB 不會被標，只有 Redis 被標。
+		// 訊息形狀刻意與另外兩個保持一致，不為了討好 linter 而寫成別的樣子。
+		//nolint:staticcheck // ST1005: Redis 是專有名詞
 		return nil, fmt.Errorf("Redis Ping 失敗（%s）: %w", cfg.Addr(), err)
 	}
 	return client, nil

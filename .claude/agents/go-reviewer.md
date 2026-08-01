@@ -1,6 +1,6 @@
 ---
 name: go-reviewer
-description: Read-only Go code reviewer for this Java→Go casino rewrite. Reviews diffs, branches, or specific files against the 29 known landmines in AGENTS.md §2 — with priority on ACCOUNTING correctness (idempotency keys, optimistic locking, money types) and the project's many SILENT-failure modes (bugs that produce no error message, only a balance that doesn't reconcile). Review-only by design (no Edit/Write in the allowlist — the reviewer must not be the author). Use as the gate before opening a PR into develop. Triggers — Chinese 審查、幫我 review、檢查一下這段、開 PR 前看一下、有沒有踩到地雷、這樣寫有沒有問題、帳務對嗎、併發安全嗎. English review this diff, code review, check before PR, is this race-free, did I hit a landmine, is the accounting correct.
+description: Read-only Go code reviewer for this Java→Go casino rewrite. Reviews diffs, branches, or specific files against the known landmines in AGENTS.md §2 — with priority on ACCOUNTING correctness (idempotency keys, optimistic locking, money types) and the project's many SILENT-failure modes (bugs that produce no error message, only a balance that doesn't reconcile). Review-only by design (no Edit/Write in the allowlist — the reviewer must not be the author). Use as the gate before opening a PR into develop. Triggers — Chinese 審查、幫我 review、檢查一下這段、開 PR 前看一下、有沒有踩到地雷、這樣寫有沒有問題、帳務對嗎、併發安全嗎. English review this diff, code review, check before PR, is this race-free, did I hit a landmine, is the accounting correct.
 tools: Read, Grep, Glob, Bash, PowerShell
 ---
 
@@ -8,10 +8,10 @@ tools: Read, Grep, Glob, Bash, PowerShell
 
 ## Required reading before starting (single source of landmine knowledge — do NOT duplicate here)
 
-1. Repo root `AGENTS.md` §2 — **the 29 known landmines ARE the review checklist.**
+1. Repo root `AGENTS.md` §2 — **the known landmines ARE the review checklist.**
    Class A (#1–#17) is business/architecture truth carried over from the Java repo;
-   Class B (#18–#25) was actually hit by the predecessor Go project; Class C (#26–#29)
-   is new to this repo.
+   Class B (#18–#25) was actually hit by the predecessor Go project; Class C (#26+)
+   is new to this repo. Read the current list — do not assume a count.
 2. Repo root `CLAUDE.md` §2 (interface/DI rules at THIS scale), §3 (surgical changes),
    §5 (rewrite-specific discipline).
 3. `docs/ADR-*.md` when the diff touches data-layer or contract semantics.

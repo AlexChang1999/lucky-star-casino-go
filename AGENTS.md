@@ -33,13 +33,16 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 | 1 | `docs/藍圖.md` | **單一真相來源**：取捨原則、技術選型、重寫順序、Phase DoD |
 | 2 | 本檔 §2 已知地雷 | 不讀會浪費時間、而且多數**沒有錯誤訊息**的坑 |
 | 3 | `docs/ADR-*.md` | 已拍板的架構決策（含推翻團隊 ADR 的理由） |
-| 4 | `README.md` | 對外門面 |
+| 4 | `docs/notes/` | **動 wallet / gateway / rank 之前必讀**：團隊 Java 版的實地查證筆記（Outbox 資料流、Redis key inventory）。⚠️ 它們用**團隊的**雷區編號，對照表在 `docs/notes/README.md` |
+| 5 | `README.md` | 對外門面 |
 
 **參考來源（唯讀）**：
 - **團隊 Java repo**：`H:\Lucky_Star_Casino\`（單層，`backend/` 直接在底下）
   ⚠️ **這個路徑會隨機器改變，開工前先 `ls` 確認**。前身專案的同一行被改錯過兩次。
   它是**唯讀參考**：可以在本機跑起來、可以改本機 `.env`，
   但**不提交任何 commit、不開 PR**。所有產出留在本 repo。
+  💡 **先查 `docs/notes/`**——常見的帳務與 Redis 問題已經查證過並標了行號，
+  不必每次都重掃 555 個 `.java` 檔。
 - **前身 Go repo**：`H:\Lucky_Star_Notify_Go\`（notification 的完成品 + 28 條地雷）
 
 ---
@@ -49,7 +52,7 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 > **A 類（#1–#17）是從團隊 repo 原封不動帶走的**——它們看起來像「Java 專案的事」，
 > 其實是業務與架構本質，換語言一樣會踩。**這一類最容易漏。**
 > **B 類（#18–#25）是前身 Go 專案實際踩過的**，已驗證適用於 Go。
-> **C 類（#26–#29）是本專案新增的。**
+> **C 類（#26–#31）是本專案新增的。**
 > 之後真的踩到新雷，**當場往下加**（§5）。
 
 ### A 類：業務與架構本質（語言無關，必須全部帶走）
@@ -63,6 +66,8 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 2. **`wallet.credit` 是「事件」、`wallet.credit.request` 才是「指令」**：
    搞反會造成**無限迴圈**——listener 收到自己發出的事件又觸發自己。
    （團隊 ADR-002 明訂這個分離，語義與語言無關。）
+   📖 事故經過與「唯一安全的例外」（read-sync 為什麼可以消費自己的事件）：
+   `docs/notes/Java版-CQRS-與指令事件分離.md`。
 
 3. **帳務＝冪等 + 防超扣，這是核心中的核心**：
    - 冪等鍵走 **UNIQUE 索引衝突**，不是先 SELECT 再 INSERT（那有 race）
@@ -77,10 +82,19 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 5. **wallet 事件走 Transactional Outbox，勿改回直接 send**：
    重構時很容易「順手簡化」掉它——但直接 send 意味著「DB 交易成功、
    送 Kafka 失敗」時事件永遠遺失，而餘額已經變了。
+   ⚠️ 附帶一個容易漏的維運面：**outbox 的列投遞成功只標 SENT、從不刪除**，
+   這張表單向成長，要配一支清理排程。**只刪 SENT，PENDING 無論多舊都不能刪**
+   （刪掉就是無聲丟失事件，正是 Outbox 要防的事）。
+   📖 完整資料流與「為什麼不同步雙寫」的四個理由：
+   `docs/notes/Java版-CQRS-與指令事件分離.md`。
 
 6. **消費端「非冪等累加」必須去重，「冪等寫入」則不可去重**：
    兩者搞反都會錯。累加型（例如統計）重複消費會多算；
    冪等寫入型（例如以主鍵 upsert）加了去重反而讓正常重放失效。
+   **判準一句話**：問「這個操作重做一次會不會出錯？」不會 → 不要去重；會 → 才去重。
+   ⚠️ 冪等操作加去重的具體災難：`ZADD` 寫入成功但進程在 ack 前崩潰 → 重送被去重標記
+   擋掉 → **值永久停在錯的中間態**，是去重機制自己製造的資料錯誤。
+   📖 `ZADD` vs `ZINCRBY` 的實例：`docs/notes/Java版-Redis-用途全解.md` §3.2。
 
 7. **`friend.relationship.updated` 是「完整清單」事件，不是增量**：
    當成增量處理會讓好友列表越積越多。事件語義看錯就是資料錯。
@@ -116,9 +130,16 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     - 捕魚 session —— Lua CAS 樂觀鎖（團隊 ADR-008，**腳本可原樣搬過來**）
     - `disabled:player:*` 後台停用標記 —— 無 TTL，清空等於所有停用玩家自動解封
     ⚠️ 所以 `docker compose down -v` 會**砍掉業務資料**。
+   📖 全部 key 的 inventory（型別 / TTL / 讀寫方）、JWT 撤銷三件套、
+   fail-open vs fail-closed 的判準：`docs/notes/Java版-Redis-用途全解.md`。
 
 17. **舊 DB volume 缺 migration 會讓服務開機即死**：
     與語言無關的維運坑。換 schema 時要嘛跑 migration，要嘛砍 volume 重建。
+    ⚠️ 本專案 2026-08-01 起 schema 一律由 **goose** 管（`docs/ADR-003`），
+    `/docker-entrypoint-initdb.d` **已經拿掉**——它只在 volume 全新時執行，
+    天生做不到「改 schema」。開發流程多一步：
+    `set -a && . deploy/.env && set +a; go run ./cmd/migrate up`。
+    忘了跑會被 `migrate.VerifyVersion` 在**開機時**擋下，不會拖到第一筆下注。
 
 ### B 類：前身 Go 專案已驗證的坑
 
@@ -179,6 +200,11 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     MySQL 要靠 `LastInsertId()`。
     ⚠️ **批次插入時 `LastInsertId()` 回的是第一筆的 id**，不是最後一筆——
     照 PG 的直覺寫會拿到錯的關聯。
+    📖 wallet 的 debit 熱路徑正好把 `RETURNING` 用在最關鍵的位置，
+    三條語句的等價實作與取捨見 `docs/ADR-002`。
+    ⚠️ 也**不要**用 `INSERT IGNORE` 當 `ON CONFLICT DO NOTHING` 的替代品：
+    它把截斷、NOT NULL、外鍵違反**全部**降級成警告，於是壞資料靜默變成
+    no-op 而餘額已經扣掉了。正解是捕捉錯誤碼 `1062`（ER_DUP_ENTRY）。
 
 27. **MongoDB 讀端是「衍生資料」，絕不可成為任何資料的唯一真相**：
     讀模型由 Kafka 事件投影而成，壞掉就重放重建，因此**沒有備份需求**。
@@ -196,6 +222,50 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     連結階段會在空白處斷成兩截，錯誤訊息是
     `C:/Users/Alex: file not recognized`——**看起來像目的檔壞掉，其實是路徑被切開**。
     解法見 §4「Windows 本機環境」。⚠️ 8.3 短檔名與 junction **都無效**。
+
+30. **⭐ MySQL 的預設定序不分大小寫，會同時弱化冪等鍵與列舉約束**：
+    MySQL 8.4 預設 `utf8mb4_0900_ai_ci`——**ai = 不分音標、ci = 不分大小寫**。
+    PostgreSQL 的預設定序區分大小寫，所以團隊 Java 版從來沒遇過這兩件事：
+    - **UNIQUE 冪等鍵被弱化**：`checkin-42` 與 `CHECKIN-42` 在索引裡是同一把鍵。
+      兩把本來不同的鍵被判定重複 → 第二筆被當成「冪等命中」跳過 → **少入一筆帳**。
+      更陰險的是 ai：`e` 與 `é` 也相等。
+    - **`CHECK ... IN (...)` 列舉被弱化**：`CHECK (type IN ('DEBIT',...))`
+      **放行小寫 `'debit'`** 並原樣存入 → Go 端 `tx.Type == "DEBIT"` 是 false、
+      事件 payload 帶著小寫進 Kafka、下游 switch 落到 default。
+      PostgreSQL 會在 INSERT 當場拒絕。
+
+    兩者的共同點是**沒有任何錯誤訊息可以指認真因**。
+    解法：帳務表裡「參與相等性判定或列舉約束」的字串欄位一律
+    `COLLATE utf8mb4_bin`（見
+    `internal/platform/migrate/migrations/00001_wallet_schema.sql`）。
+    ⚠️ **不要改全域預設**——暱稱、商品名稱這類欄位**應該**是 ci 的
+    （搜尋「Alex」要找得到「alex」）。定序是 per-column 的正確性選擇。
+    ⚠️ DSN 裡的 `collation=` 是**連線定序**，管不到欄位：比對時欄位定序
+    （coercibility 2）優先於字面值的連線定序（coercibility 4）。
+    設了連線定序不代表你安全了。
+    已於 2026-08-01 對 MySQL 8.4.10 實測驗證兩個方向，並由
+    `internal/wallet/store/schema_infra_test.go` 釘住。
+
+31. **⭐ MySQL 沒有交易式 DDL，所以 migration 失敗會留下半套 schema**：
+    PostgreSQL 的 DDL 可以放進交易裡回滾，團隊 Java 版因此從來不必想這件事。
+    MySQL 的 DDL 會**隱式 commit**——把 DDL 包在 `BEGIN` 裡不會報錯，
+    只是那個交易在第一條 DDL 執行時就已經自己 commit 掉了。後果：
+    - 一個 migration 裡兩條 `CREATE TABLE`，第二條失敗 → 第一條**已經在了**，
+      而版本表**沒有記錄** → 下次重跑撞 duplicate，工具卻認為「從沒跑過」。
+    - **多副本服務同時啟動一起下 DDL**，不是「重複做一次白工」，
+      而是併發 DDL 撞在一起留下半套 schema。
+      ⚠️ goose 對 PostgreSQL 有 advisory lock 可擋（`WithSessionLocker`），
+      **對 MySQL 沒有內建的**。
+
+    因此本專案的規矩（`docs/ADR-003`）：
+    - migration **不在服務啟動時自動跑**，走獨立的 `go run ./cmd/migrate up`
+      （K8s 用 Job / initContainer）。服務端只做 `migrate.VerifyVersion`
+      ——**檢查**版本，不**修改** schema。
+    - DDL migration 明寫 `-- +goose NO TRANSACTION`：反正沒有原子性，
+      不如讓這件事在檔案裡看得見。⚠️ 純 DML 的 migration **要保留交易**。
+    - 一個 migration 盡量只放一條 DDL，多條時要能重入。
+    - ⚠️ 這也是否決 golang-migrate 的主因：它失敗會把版本表標成 dirty
+      並拒絕後續執行，而在 MySQL 上 dirty 是**常態**不是意外。
 
 ---
 
@@ -240,10 +310,15 @@ Memcached、自建區塊鏈節點、冷熱錢包、Vault/KMS、GKE。理由見�
 
 ```
 cmd/<service>/        每個服務一個 main
+cmd/migrate/          schema migration CLI（docs/ADR-003）
 internal/<service>/   各服務私有實作
 internal/platform/    跨服務共用（設定、DB 連線、log、Kafka）
+internal/platform/migrate/            migration 本體，SQL 用 //go:embed 打進 binary
+internal/platform/migrate/migrations/ ⭐ schema 的**唯一真相**
+internal/platform/mysqltest/          infra 測試共用的臨時資料庫（⚠️ 只准測試檔 import）
 deploy/               compose 與部署設定
 docs/                 藍圖與 ADR
+docs/notes/           團隊 Java 版的實地查證筆記（唯讀參考，非本專案設計）
 test/contract/        跨語言黑箱契約測試（同一份對 Java 與 Go 都跑）
 test/load/            Go 自寫壓測 client
 ```
@@ -295,11 +370,22 @@ go build ./...
 cp deploy/.env.example deploy/.env    # 首次
 docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env up -d --wait
 
+# ⚠️ compose up 之後 schema 是空的——initdb.d 已經拿掉（地雷 #17、docs/ADR-003）
+set -a && . deploy/.env && set +a
+go run ./cmd/migrate up
+go run ./cmd/migrate status          # 確認每個版本都是 applied
+
+# 需要基礎設施真的起來的測試（環境變數同上）
+go test -race -tags=infra ./...
+
 # 收工。⚠️ 不要隨手加 -v，Redis 是主儲存（地雷 #16）
 docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env down
 ```
 
 **規則**：
+- **改 schema 一律是「加一個新的 migration 檔」**，不是去改既有的那個。
+  改既有的檔在你的機器上會「看起來沒事」（版本已 applied，goose 不會重跑），
+  但新環境會拿到不同的 schema——**沒有錯誤訊息**的那種不一致。
 - **`-race` 是硬性要求，不是選配**。這是併發服務，沒有競態偵測器的測試等於沒測。
   （Java 沒有等價工具，這點值得在 README 講。）
 - 模糊測試找到的失敗案例會被寫進 `testdata/fuzz/`——**有價值的要手動搬進版控**

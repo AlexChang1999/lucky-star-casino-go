@@ -69,6 +69,13 @@ services:
       start_period: 20s
     volumes:
       - casino_go_mysql_data:/var/lib/mysql
+      # ⚠️ 這裡**刻意不掛** /docker-entrypoint-initdb.d（2026-08-01 移除）。
+      # 官方映像只在 volume 全新時跑 initdb.d（地雷 #17），所以它天生做不到
+      # 「改 schema」這件事——第二次改欄位就會變成「新環境有、舊環境沒有」，
+      # 而且兩邊都不報錯。schema 現在一律由 goose 管理（docs/ADR-003）：
+      #
+      #   set -a && . deploy/.env && set +a
+      #   go run ./cmd/migrate up
     networks:
       - casino-go-network
 
