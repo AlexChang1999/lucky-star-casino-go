@@ -52,7 +52,7 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 > **A 類（#1–#17）是從團隊 repo 原封不動帶走的**——它們看起來像「Java 專案的事」，
 > 其實是業務與架構本質，換語言一樣會踩。**這一類最容易漏。**
 > **B 類（#18–#25）是前身 Go 專案實際踩過的**，已驗證適用於 Go。
-> **C 類（#26–#30）是本專案新增的。**
+> **C 類（#26–#31）是本專案新增的。**
 > 之後真的踩到新雷，**當場往下加**（§5）。
 
 ### A 類：業務與架構本質（語言無關，必須全部帶走）
@@ -135,6 +135,11 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 
 17. **舊 DB volume 缺 migration 會讓服務開機即死**：
     與語言無關的維運坑。換 schema 時要嘛跑 migration，要嘛砍 volume 重建。
+    ⚠️ 本專案 2026-08-01 起 schema 一律由 **goose** 管（`docs/ADR-003`），
+    `/docker-entrypoint-initdb.d` **已經拿掉**——它只在 volume 全新時執行，
+    天生做不到「改 schema」。開發流程多一步：
+    `set -a && . deploy/.env && set +a; go run ./cmd/migrate up`。
+    忘了跑會被 `migrate.VerifyVersion` 在**開機時**擋下，不會拖到第一筆下注。
 
 ### B 類：前身 Go 專案已驗證的坑
 
@@ -231,7 +236,8 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 
     兩者的共同點是**沒有任何錯誤訊息可以指認真因**。
     解法：帳務表裡「參與相等性判定或列舉約束」的字串欄位一律
-    `COLLATE utf8mb4_bin`（見 `deploy/mysql/init/01-wallet-schema.sql`）。
+    `COLLATE utf8mb4_bin`（見
+    `internal/platform/migrate/migrations/00001_wallet_schema.sql`）。
     ⚠️ **不要改全域預設**——暱稱、商品名稱這類欄位**應該**是 ci 的
     （搜尋「Alex」要找得到「alex」）。定序是 per-column 的正確性選擇。
     ⚠️ DSN 裡的 `collation=` 是**連線定序**，管不到欄位：比對時欄位定序
@@ -239,6 +245,27 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     設了連線定序不代表你安全了。
     已於 2026-08-01 對 MySQL 8.4.10 實測驗證兩個方向，並由
     `internal/wallet/store/schema_infra_test.go` 釘住。
+
+31. **⭐ MySQL 沒有交易式 DDL，所以 migration 失敗會留下半套 schema**：
+    PostgreSQL 的 DDL 可以放進交易裡回滾，團隊 Java 版因此從來不必想這件事。
+    MySQL 的 DDL 會**隱式 commit**——把 DDL 包在 `BEGIN` 裡不會報錯，
+    只是那個交易在第一條 DDL 執行時就已經自己 commit 掉了。後果：
+    - 一個 migration 裡兩條 `CREATE TABLE`，第二條失敗 → 第一條**已經在了**，
+      而版本表**沒有記錄** → 下次重跑撞 duplicate，工具卻認為「從沒跑過」。
+    - **多副本服務同時啟動一起下 DDL**，不是「重複做一次白工」，
+      而是併發 DDL 撞在一起留下半套 schema。
+      ⚠️ goose 對 PostgreSQL 有 advisory lock 可擋（`WithSessionLocker`），
+      **對 MySQL 沒有內建的**。
+
+    因此本專案的規矩（`docs/ADR-003`）：
+    - migration **不在服務啟動時自動跑**，走獨立的 `go run ./cmd/migrate up`
+      （K8s 用 Job / initContainer）。服務端只做 `migrate.VerifyVersion`
+      ——**檢查**版本，不**修改** schema。
+    - DDL migration 明寫 `-- +goose NO TRANSACTION`：反正沒有原子性，
+      不如讓這件事在檔案裡看得見。⚠️ 純 DML 的 migration **要保留交易**。
+    - 一個 migration 盡量只放一條 DDL，多條時要能重入。
+    - ⚠️ 這也是否決 golang-migrate 的主因：它失敗會把版本表標成 dirty
+      並拒絕後續執行，而在 MySQL 上 dirty 是**常態**不是意外。
 
 ---
 
@@ -283,9 +310,13 @@ Memcached、自建區塊鏈節點、冷熱錢包、Vault/KMS、GKE。理由見�
 
 ```
 cmd/<service>/        每個服務一個 main
+cmd/migrate/          schema migration CLI（docs/ADR-003）
 internal/<service>/   各服務私有實作
 internal/platform/    跨服務共用（設定、DB 連線、log、Kafka）
-deploy/               compose 與部署設定（含 mysql/init 的 schema SQL）
+internal/platform/migrate/            migration 本體，SQL 用 //go:embed 打進 binary
+internal/platform/migrate/migrations/ ⭐ schema 的**唯一真相**
+internal/platform/mysqltest/          infra 測試共用的臨時資料庫（⚠️ 只准測試檔 import）
+deploy/               compose 與部署設定
 docs/                 藍圖與 ADR
 docs/notes/           團隊 Java 版的實地查證筆記（唯讀參考，非本專案設計）
 test/contract/        跨語言黑箱契約測試（同一份對 Java 與 Go 都跑）
@@ -339,11 +370,22 @@ go build ./...
 cp deploy/.env.example deploy/.env    # 首次
 docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env up -d --wait
 
+# ⚠️ compose up 之後 schema 是空的——initdb.d 已經拿掉（地雷 #17、docs/ADR-003）
+set -a && . deploy/.env && set +a
+go run ./cmd/migrate up
+go run ./cmd/migrate status          # 確認每個版本都是 applied
+
+# 需要基礎設施真的起來的測試（環境變數同上）
+go test -race -tags=infra ./...
+
 # 收工。⚠️ 不要隨手加 -v，Redis 是主儲存（地雷 #16）
 docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env down
 ```
 
 **規則**：
+- **改 schema 一律是「加一個新的 migration 檔」**，不是去改既有的那個。
+  改既有的檔在你的機器上會「看起來沒事」（版本已 applied，goose 不會重跑），
+  但新環境會拿到不同的 schema——**沒有錯誤訊息**的那種不一致。
 - **`-race` 是硬性要求，不是選配**。這是併發服務，沒有競態偵測器的測試等於沒測。
   （Java 沒有等價工具，這點值得在 README 講。）
 - 模糊測試找到的失敗案例會被寫進 `testdata/fuzz/`——**有價值的要手動搬進版控**

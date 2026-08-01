@@ -164,11 +164,12 @@ InnoDB 的重複鍵錯誤只是**語句級**失敗，交易仍然可用。
 
 **待辦**
 
-- 🔶 **migration 工具尚未選定**。目前只有一次性建表 SQL 掛在
-  `/docker-entrypoint-initdb.d`，而它**只在 volume 全新時執行**（地雷 #17）。
-  **Phase A 結束前必須補上**，否則第二次改 schema 就會重現團隊那個坑。
-  `VerifyWalletSchema` 是現階段的緩解——它讓「忘了套用」在**開機時**就失敗，
-  而不是等到第一筆下注。
+- ✅ ~~**migration 工具尚未選定**~~ —— **2026-08-01 由 `docs/ADR-003` 結案**：
+  選 goose、SQL 用 `//go:embed` 打進 binary、`/docker-entrypoint-initdb.d`
+  整個移除、migration 走獨立的 `cmd/migrate`（因為 MySQL 沒有交易式 DDL，
+  新增地雷 #31）。`VerifyWalletSchema` 從「唯一的緩解」變成
+  `migrate.VerifyVersion` 的**互補**：前者問「schema 長得對嗎」，
+  後者問「migration 跑到最新了嗎」。
 
 ---
 

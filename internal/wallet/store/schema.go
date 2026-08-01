@@ -47,10 +47,14 @@ var requiredChecks = []string{
 
 // VerifyWalletSchema 在服務啟動時確認 schema 已正確套用。
 //
-// 為什麼需要這個函式：MySQL 官方映像的 /docker-entrypoint-initdb.d
-// **只在 volume 全新時執行**（AGENTS.md 地雷 #17）。在既有 volume 上改
-// .sql 檔完全沒有效果，而且沒有任何提示——症狀是第一筆下注才炸，
-// 那時候的堆疊指向業務程式碼，指不到真因。
+// ⚠️ 它與 internal/platform/migrate.VerifyVersion 是**互補**的，不是重複：
+//   - VerifyVersion 問「migration 跑到最新了嗎」——通用，任何未來的
+//     migration 忘了跑都會被抓到，但它只看版本號。
+//   - 這個函式問「跑出來的東西長得對嗎」——具體，釘住定序、CHECK、UNIQUE
+//     這些版本號看不出來的事（有人手動 ALTER 過、或 baseline 的
+//     `CREATE TABLE IF NOT EXISTS` 在既有的表上整段跳過）。
+//
+// 兩個都要，而且都只在開機時跑一次，不在熱路徑上。
 //
 // ⚠️ 它一次回報**所有**問題（errors.Join）而不是遇到第一個就返回，
 // 沿用 internal/platform/config 的做法：修一個、重跑、再看到下一個，
@@ -98,7 +102,7 @@ func verifyTables(ctx context.Context, db *gorm.DB) error {
 		}
 	}
 	return fmt.Errorf("wallet schema 尚未套用，缺少資料表 %v"+
-		"（volume 已存在時 initdb.d 不會重跑，套用方式見 deploy/mysql/init/01-wallet-schema.sql 檔頭）", missing)
+		"（執行 `go run ./cmd/migrate up`）", missing)
 }
 
 func verifyCollations(ctx context.Context, db *gorm.DB) error {

@@ -1,23 +1,26 @@
 -- ============================================================================
--- wallet 帳務 schema（MySQL 8.4 寫入主庫）
+-- 00001 — wallet 帳務 schema（MySQL 8.4 寫入主庫）
 --
 -- 來源：團隊 Java repo 的 database/postgres/init.sql（唯讀參考），逐欄位翻譯。
 -- 口徑查證紀錄見 docs/notes/Java版-wallet-帳務口徑.md，
 -- PostgreSQL → MySQL 的三個非顯而易見差異見 docs/ADR-002。
+-- 本檔原本掛在 /docker-entrypoint-initdb.d/，2026-08-01 改由 goose 管理（docs/ADR-003）。
 --
--- ⚠️ 這個檔掛在 /docker-entrypoint-initdb.d/，官方映像**只在 volume 全新時**執行
--- （AGENTS.md 地雷 #17）。volume 已存在時要手動套用：
+-- ⚠️ NO TRANSACTION 是刻意的，不是偷懶（AGENTS.md 地雷 #31）：
+-- MySQL 的 DDL 會**隱式 commit**，把 DDL 包在交易裡只會得到假的安全感——
+-- 三條 CREATE TABLE 的第二條失敗時，第一條**已經存在了**，而且版本表沒記錄。
+-- PostgreSQL 的 DDL 可回滾，所以團隊 Java 版從來不必想這件事。
+-- 明寫 NO TRANSACTION 讓「這裡沒有原子性」變成程式碼裡看得到的事實。
+-- ⚠️ 這條規則只適用於 DDL。純 DML 的 migration（補資料、改值）**要保留交易**。
 --
---   docker exec -i casino-go-mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" \
---     lucky_star_casino < deploy/mysql/init/01-wallet-schema.sql
---
--- 忘了套用的症狀不是「開機即死」而是「第一筆下注才炸」，所以
--- internal/wallet/store 的 infra 測試會直接斷言這三張表與約束存在。
---
--- 🔶 尚未決定：正式的 migration 工具（golang-migrate / goose）。
--- 現在只有一次性建表，還撐得住；**Phase A 結束前必須補上**，
--- 否則第二次改 schema 就會重現團隊那個坑。
+-- ⚠️ 只有這個 baseline 使用 IF NOT EXISTS，之後的 migration 一律不准用。
+-- 理由：它要能在「initdb.d 時代就已經建好表」的既有 volume 上安全地跑一次，
+-- 把版本表補記成 1 而不是撞 duplicate。代價是它**看不出定義漂移**
+-- （表存在但欄位不同時它靜靜跳過）——那正是 VerifyWalletSchema 存在的理由。
 -- ============================================================================
+
+-- +goose NO TRANSACTION
+-- +goose Up
 
 -- ── wallets：玩家錢包主表（唯一真相）─────────────────────────────────
 -- 金額單位是「星幣」，整數、無小數 —— 所以用 BIGINT 而不是 DECIMAL。
@@ -70,7 +73,15 @@ CREATE TABLE IF NOT EXISTS wallet_transactions (
         'BET', 'SHOP_PURCHASE',
         'WIN', 'CHECKIN', 'TASK', 'GIFT', 'GM_REWARD', 'BANKRUPTCY_AID',
         'DIAMOND_EXCHANGE', 'TOPUP', 'CASHBACK', 'REFUND', 'MONTHLY_REWARD'
-    ))
+    )),
+    -- 查詢型索引：對齊 Java 版（流水頁固定是「某玩家、時間倒序、分頁」）。
+    -- MySQL 8.0 起真的支援 DESC 索引（5.7 只是解析後忽略），所以這裡照搬有效。
+    -- ⚠️ 寫在 CREATE TABLE 裡而不是獨立的 CREATE INDEX，是為了讓整個 migration
+    -- 只由 IF NOT EXISTS 的語句組成——MySQL 沒有 CREATE INDEX IF NOT EXISTS，
+    -- 拆出去就會在既有 volume 上撞 duplicate key name。
+    KEY idx_wallet_transactions_player_id   (player_id),
+    KEY idx_wallet_transactions_created_at  (created_at),
+    KEY idx_wallet_transactions_player_time (player_id, created_at DESC)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
 
 -- ⭐⭐ 為什麼這張表的字串欄位全部要 COLLATE utf8mb4_bin（AGENTS.md 地雷 #30）
@@ -95,12 +106,6 @@ CREATE TABLE IF NOT EXISTS wallet_transactions (
 -- 因為玩家暱稱、商品名稱這類欄位**應該**是 ci 的（搜尋「Alex」要找得到「alex」）。
 -- 定序是 per-column 的正確性選擇，不是全域開關。
 
--- 查詢型索引：對齊 Java 版（流水頁固定是「某玩家、時間倒序、分頁」）。
--- MySQL 8.0 起真的支援 DESC 索引（5.7 只是解析後忽略），所以這裡照搬有效。
-CREATE INDEX idx_wallet_transactions_player_id    ON wallet_transactions (player_id);
-CREATE INDEX idx_wallet_transactions_created_at   ON wallet_transactions (created_at);
-CREATE INDEX idx_wallet_transactions_player_time  ON wallet_transactions (player_id, created_at DESC);
-
 -- ── wallet_outbox：Transactional Outbox 待發事件（地雷 #5）────────────
 -- 這是一張**普通的 MySQL 表**，不是 Kafka 的元件。它跟帳務異動落在
 -- 同一個交易裡，把「跨系統一致性」壓縮回「單一資料庫的交易」。
@@ -115,11 +120,10 @@ CREATE TABLE IF NOT EXISTS wallet_outbox (
     created_at  DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     sent_at     DATETIME(6)  NULL,
     CONSTRAINT pk_wallet_outbox         PRIMARY KEY (id),
-    CONSTRAINT chk_wallet_outbox_status CHECK (status IN ('PENDING', 'SENT'))
+    CONSTRAINT chk_wallet_outbox_status CHECK (status IN ('PENDING', 'SENT')),
+    -- poller 的撈取條件就是 (status, created_at)，所以索引照這個順序建。
+    KEY idx_wallet_outbox_status_created (status, created_at)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4;
-
--- poller 的撈取條件就是 (status, created_at)，所以索引照這個順序建。
-CREATE INDEX idx_wallet_outbox_status_created ON wallet_outbox (status, created_at);
 
 -- payload 用 TEXT 而不是 MySQL 的 JSON 型別：outbox 從不查詢 payload 內容，
 -- 只是原封不動搬進 Kafka。用 JSON 型別會讓 MySQL 做解析與正規化
@@ -130,3 +134,13 @@ CREATE INDEX idx_wallet_outbox_status_created ON wallet_outbox (status, created_
 -- 每筆下注/派彩/贈禮都寫一列。清理排程要在 Phase A 內補上，規則是
 -- **只刪 SENT**（PENDING 無論多舊都不能刪，刪掉就是無聲丟失事件），
 -- 保留期對齊消費端去重標記的 TTL（7 天）。
+
+-- +goose Down
+
+-- ⚠️ 這會**刪掉全部帳務資料**。它存在是因為 down 是 migration 工具的契約
+-- （少了它，「這個版本能不能退回去」只能靠猜），不是因為它該被執行。
+-- 正式環境的回退手段是備份還原，不是 `goose down`。
+-- 順序與建表相反：outbox → transactions → wallets。
+DROP TABLE IF EXISTS wallet_outbox;
+DROP TABLE IF EXISTS wallet_transactions;
+DROP TABLE IF EXISTS wallets;

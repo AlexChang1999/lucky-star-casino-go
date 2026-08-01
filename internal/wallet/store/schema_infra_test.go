@@ -21,9 +21,12 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/gorm"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/config"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/migrate"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/mysqltest"
 	platformstore "github.com/AlexChang1999/lucky-star-casino-go/internal/platform/store"
 )
 
@@ -64,7 +67,43 @@ func TestVerifyWalletSchema(t *testing.T) {
 	db, ctx := openDB(t)
 
 	if err := VerifyWalletSchema(ctx, db); err != nil {
-		t.Fatalf("schema 自檢失敗（是不是忘了套用 deploy/mysql/init/01-wallet-schema.sql？）:\n%v", err)
+		t.Fatalf("schema 自檢失敗（是不是忘了跑 `go run ./cmd/migrate up`？）:\n%v", err)
+	}
+}
+
+// TestMigrationProducesVerifiableSchema 把 migration 與帳務自檢接起來。
+//
+// ⭐ 這是兩者之間唯一的接縫測試，而且它必須跑在**空的**資料庫上。
+// 上面那個 TestVerifyWalletSchema 跑在共用的開發庫，而那個庫的表可能是
+// initdb.d 時代留下來的——也就是說，就算有人在 migration 裡把 COLLATE 刪掉，
+// 在既有的庫上也**驗不出來**：00001 是 `CREATE TABLE IF NOT EXISTS`，
+// 表已存在就整段跳過，測試照樣綠。
+//
+// 換句話說：沒有這個測試的話，「schema 定義」與「schema 檢查」是兩份
+// 各自為政的清單，改了一邊不會有人告訴你另一邊沒跟上。
+func TestMigrationProducesVerifiableSchema(t *testing.T) {
+	sqlDB := mysqltest.NewScratchDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+
+	provider, err := migrate.New(sqlDB)
+	if err != nil {
+		t.Fatalf("建立 migration provider 失敗: %v", err)
+	}
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("套用 migration 失敗: %v", err)
+	}
+
+	// 把 GORM 包在既有的 *sql.DB 上，而不是另開一條連線：臨時資料庫的
+	// 生命週期由 mysqltest 管，多開一條連線就多一個要記得關的東西。
+	db, err := gorm.Open(gormmysql.New(gormmysql.Config{Conn: sqlDB}), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("包裝 GORM 失敗: %v", err)
+	}
+
+	if err := VerifyWalletSchema(ctx, db); err != nil {
+		t.Fatalf("migration 產出的 schema 沒有通過帳務自檢——"+
+			"migration 與 VerifyWalletSchema 兩邊有一邊沒跟上:\n%v", err)
 	}
 }
 

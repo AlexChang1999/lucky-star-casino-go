@@ -206,8 +206,8 @@ func TestIdempotencyKeyIsCaseSensitive(t *testing.T) {
 // 「加了常數卻忘了加進方向表」當場失敗，而不是等到執行時回一句
 // 「未知的帳務子類型」。
 func TestSubTypeDirectionCoversSchema(t *testing.T) {
-	// 這份清單必須與 deploy/mysql/init/01-wallet-schema.sql 的
-	// chk_wt_sub_type 一字不差。刻意手寫而不是從 map 生成——
+	// 這份清單必須與 internal/platform/migrate/migrations/00001_wallet_schema.sql
+	// 的 chk_wt_sub_type 一字不差。刻意手寫而不是從 map 生成——
 	// 從 map 生成的話，map 漏一個這個測試就跟著漏一個。
 	schemaSubTypes := []SubType{
 		"BET", "SHOP_PURCHASE",

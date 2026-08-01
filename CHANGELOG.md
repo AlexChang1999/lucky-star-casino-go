@@ -5,6 +5,112 @@
 
 ---
 
+## [chore] — 2026-08-01 — schema migration 改由 goose 管理，並清掉既有 lint
+
+結掉 `docs/ADR-002` 的待辦（migration 工具未選定），順手把既有的 lint 問題清乾淨。
+**沒有業務行為變更**，但**開發流程變了**：`compose up` 之後多一步 `migrate up`。
+
+**Added**
+
+- **`docs/ADR-003`——schema migration 以 goose 管理，且不在服務啟動時自動執行**。
+- **`internal/platform/migrate`——migration 本體**。SQL 用 `//go:embed` 打進 binary，
+  因為 migration 與程式碼**必須是同一個版本**——執行時讀目錄的話，
+  「binary 是新的、SQL 目錄是舊的」是一個跑得起來的狀態，而症狀是「欄位不存在」。
+- **`internal/platform/migrate.VerifyVersion`——開機時的版本守門**。
+  這是地雷 #17 的**通用**解法：任何未來的 migration 忘了跑都會被抓到，
+  不需要有人記得回頭維護一份硬編碼的檢查清單。
+- **`cmd/migrate`——CLI**（`up` / `down` / `status` / `version`）。
+  ⚠️ `down` 強制明寫 `-yes`，因為 00001 的 Down 會 `DROP` 掉全部帳務表。
+- **`internal/platform/mysqltest`——infra 測試共用的臨時資料庫**。
+  形狀對齊標準庫的 `net/http/httptest`：**測試支援程式碼是正式程式碼，
+  只是沒有人在正式路徑上 import 它**。⚠️ 它在非 `_test.go` 檔裡 import
+  `testing`，所以**只准測試檔 import**。
+- **`config.LoadMySQL`**——只載入 MySQL 的設定。`cmd/migrate` 不碰 Mongo，
+  不該因為 `MONGO_ROOT_PASSWORD` 沒設就拒絕啟動：那個錯誤訊息與它要做的事
+  完全無關，正是本專案最想避免的形狀。
+- **地雷 #31**（見下）。
+
+**Changed**
+
+- **`deploy/mysql/init/` 整個移除**，`docker-compose.infra.yml` 不再掛
+  `/docker-entrypoint-initdb.d`。schema 的唯一真相搬到
+  `internal/platform/migrate/migrations/00001_wallet_schema.sql`。
+  **為什麼不保留當「全新 volume 的快速路徑」**：那等於同一份 schema 有兩個來源，
+  而兩份定義一定會漂移——漂移的症狀是「新舊環境 schema 不一樣」且不報錯。
+- **`VerifyWalletSchema` 的定位**：從「migration 缺席時的唯一緩解」變成
+  `VerifyVersion` 的**互補**。前者問「schema 長得對嗎」（定序 / CHECK / UNIQUE），
+  後者問「migration 跑到最新了嗎」。兩個都要，都只在開機時跑一次。
+- **`AGENTS.md`**：新增地雷 #31、#17 補上 goose 的流程、§3 目錄表更新、
+  §4 驗證指令加入 `migrate up` 與「改 schema 一律是加新檔」的規則。
+- **lint 清零**（`golangci-lint run` 與 `--build-tags=infra` 都是 0 issues）：
+  - `store.go` 的 **ST1005** 是**誤判**，用 `//nolint` 標記並寫明理由：
+    那條規則本意是「除非專有名詞或縮寫」，但 staticcheck 的啟發式只認得
+    **含兩個以上大寫字母**的字——所以 `MySQL` / `MongoDB` 不被標，只有 `Redis` 被標。
+    訊息形狀刻意與另外兩個保持一致，不為了討好 linter 而改成別的樣子。
+  - `store_infra_test.go` 的 **errcheck ×3**：`Close` / `Drop` 失敗改成 `t.Errorf`
+    而不是丟掉——連線沒關乾淨會讓**後面**的測試莫名其妙拿不到連線。
+  - `store_infra_test.go` 的 **SA1019**：`ZRevRange` → `ZRangeArgs{Rev: true}`。
+    Redis 6.2 起 `ZREVRANGE` 已被取代，而排行榜是本專案的主儲存之一，
+    熱路徑上的指令一開始就用對，比之後全域搜尋替換便宜。
+
+**⭐ 地雷 #31：MySQL 沒有交易式 DDL，migration 失敗會留下半套 schema**
+
+與地雷 #26（沒有 `RETURNING`）同源——**團隊的 PostgreSQL 經驗在這裡不適用**。
+PostgreSQL 的 DDL 可以放進交易裡回滾；MySQL 的 DDL 會**隱式 commit**，
+把它包在 `BEGIN` 裡不會報錯，只是那個交易在第一條 DDL 就自己 commit 掉了。
+
+1. 一個 migration 裡兩條 `CREATE TABLE`，第二條失敗 → 第一條**已經在了**、
+   版本表**沒有記錄** → 下次重跑撞 duplicate，而工具認為「從沒跑過」。
+2. 多副本服務同時啟動一起下 DDL → 併發 DDL 撞在一起留下半套 schema。
+   goose 對 PostgreSQL 有 advisory lock 可擋，**對 MySQL 沒有內建的**。
+
+所以 migration 是**獨立的一步**（`cmd/migrate`），服務端只做 `VerifyVersion`
+——**檢查**版本，不**修改** schema。DDL migration 一律明寫
+`-- +goose NO TRANSACTION`：反正沒有原子性，不如讓它在檔案裡看得見。
+⚠️ 純 DML 的 migration **要保留交易**。
+這條也是否決 golang-migrate 的主因：它失敗會把版本表標成 dirty 並拒絕後續執行，
+而在 MySQL 上 dirty 是**常態**不是意外。
+
+**如何驗證**
+
+```
+gofmt -l .                                     # 無輸出
+go vet ./...                                   # OK
+go build ./...                                 # OK
+golangci-lint run                              # 0 issues
+golangci-lint run --build-tags=infra           # 0 issues（之前是 5 個）
+go test -race ./...                            # 全綠
+go test -race -tags=infra ./...                # 6 個套件全綠
+```
+
+`-tags=infra` 那組**實際連上 MySQL 8.4.10**，每個測試在自己的臨時資料庫上跑：
+
+| 測試 | 釘住的主張 |
+|---|---|
+| `TestMigrationFilesAreWellFormed` | 檔名格式、**版號不得重複**（ADR-001 決策 5：團隊有兩個 `V15__` 並存）、Up/Down 都在、只有 baseline 可用 `IF NOT EXISTS` |
+| `TestMigrationsApplyFromEmptyDatabase` | 空庫被 `VerifyVersion` 擋下 → `up` → 表出現 → 重跑是 no-op → `down` 後又被擋下 |
+| `TestMigrationProducesVerifiableSchema` | ⭐ **migration 的產出通過帳務自檢**——在**空的**臨時庫上跑，因為在既有的庫上 `CREATE TABLE IF NOT EXISTS` 整段跳過，測試會綠得毫無意義 |
+
+CLI 也在**既有的開發庫**（表是 initdb.d 時代建的）上實走過一次轉移：
+`status` 顯示 `pending` → `up` 8ms 完成且**不動既有的表** → `status` 顯示 `applied`
+→ 再 `up` 一次回「沒有待套用的 migration」。
+這正是 baseline 用 `IF NOT EXISTS` 要換到的東西。
+
+**誠實記錄的負面後果**
+
+- **多一個部署步驟**：全新環境不再是 `compose up` 就能跑。這是「schema 只有
+  一個地方定義」的代價，接受。
+- **多一個依賴**（goose + 3 個間接）。這是本專案第一個「為工程流程而非業務功能」
+  引入的套件。
+- **baseline 的 `IF NOT EXISTS` 看不出定義漂移**（表存在但欄位不同時靜靜跳過）。
+  緩解是 `TestMigrationProducesVerifiableSchema` 在空庫上驗，
+  以及單元測試禁止 00001 以後的 migration 再用它。
+- 🔶 **多副本的 migration 併發鎖尚未處理**，目前靠「migration 是獨立的一步」迴避。
+  等真的跑到 K8s（Phase H）再評估。
+- 🔶 **outbox 清理排程仍未實作**（地雷 #5），同樣掛在 Phase A 待辦。
+
+---
+
 ## [feat] — 2026-08-01 — Phase A 起步：wallet 帳務 schema 與 domain 契約
 
 Phase A（wallet 重構）的第一個切片。**還沒有任何業務端點**——

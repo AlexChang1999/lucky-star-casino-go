@@ -44,7 +44,13 @@ func TestOpenMySQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("取得底層 *sql.DB 失敗: %v", err)
 	}
-	defer sqlDB.Close()
+	// 關閉失敗要說出來而不是丟掉：連線沒關乾淨會讓後面的測試莫名其妙拿不到連線，
+	// 而那時候的錯誤訊息指向後面那個測試，不是這裡。
+	defer func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Errorf("關閉 MySQL 連線失敗: %v", err)
+		}
+	}()
 
 	t.Run("連線池參數有真的套用", func(t *testing.T) {
 		// 這裡驗的是「我們設的值有生效」，不是「值選得對」——
@@ -103,7 +109,11 @@ func TestOpenMongo(t *testing.T) {
 
 	t.Run("可寫可讀（讀端投影的前提）", func(t *testing.T) {
 		coll := db.Collection("_smoke_probe")
-		defer coll.Drop(ctx)
+		defer func() {
+			if err := coll.Drop(ctx); err != nil {
+				t.Errorf("清除探測 collection 失敗: %v", err)
+			}
+		}()
 
 		if _, err := coll.InsertOne(ctx, map[string]any{"probe": true}); err != nil {
 			t.Fatalf("寫入失敗: %v", err)
@@ -127,7 +137,11 @@ func TestOpenRedis(t *testing.T) {
 	if err != nil {
 		t.Fatalf("連 Redis 失敗: %v", err)
 	}
-	defer client.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("關閉 Redis 連線失敗: %v", err)
+		}
+	}()
 
 	t.Run("ZSET 可用（排行榜是主儲存）", func(t *testing.T) {
 		const key = "_smoke_probe:zset"
@@ -138,9 +152,14 @@ func TestOpenRedis(t *testing.T) {
 		if err := client.ZAdd(ctx, key, alice, bob).Err(); err != nil {
 			t.Fatalf("ZAdd 失敗: %v", err)
 		}
-		top, err := client.ZRevRange(ctx, key, 0, 0).Result()
+		// ⚠️ 不用 ZRevRange：Redis 6.2 起 ZREVRANGE 已被 ZRANGE ... REV 取代，
+		// go-redis 因此把它標了 deprecated。排行榜是本專案的主儲存之一，
+		// 熱路徑上的 Redis 指令一開始就用對，比之後全域搜尋替換便宜。
+		top, err := client.ZRangeArgs(ctx, redis.ZRangeArgs{
+			Key: key, Start: 0, Stop: 0, Rev: true,
+		}).Result()
 		if err != nil {
-			t.Fatalf("ZRevRange 失敗: %v", err)
+			t.Fatalf("ZRange(Rev) 失敗: %v", err)
 		}
 		if len(top) != 1 || top[0] != "bob" {
 			t.Errorf("排行榜第一名 = %v, want [bob]", top)

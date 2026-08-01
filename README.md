@@ -58,14 +58,24 @@
 cp deploy/.env.example deploy/.env          # 首次，改掉裡面的密碼
 docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env up -d --wait
 
-# 2. 測試
-go test -race ./...                          # 單元測試
+# 2. schema。⚠️ compose up 之後 schema 是空的——這一步不能省
 set -a && . deploy/.env && set +a
+go run ./cmd/migrate up
+go run ./cmd/migrate status                  # 每個版本都該是 applied
+
+# 3. 測試
+go test -race ./...                          # 單元測試
 go test -race -tags=infra ./...              # 需要基礎設施真的起來
 
-# 3. 收工。⚠️ 不要隨手加 -v，Redis 是主儲存
+# 4. 收工。⚠️ 不要隨手加 -v，Redis 是主儲存
 docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env down
 ```
+
+> **為什麼 schema 不是 `compose up` 就好？**
+> MySQL 官方映像的 `/docker-entrypoint-initdb.d` **只在 volume 全新時執行**，
+> 也就是它天生做不到「改 schema」——第二次改欄位就會變成「新環境有、舊環境沒有」
+> 而且兩邊都不報錯。所以 schema 由 [goose](docs/ADR-003-schema-migration-以-goose-管理.md) 管，
+> 而服務啟動時會檢查版本，忘了跑會**開不起來**而不是等到第一筆交易才炸。
 
 **對外埠**（與團隊 repo、`notify-go` 全部錯開，三套要能同時跑）：
 
@@ -91,7 +101,7 @@ docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env down
    同一份黑箱契約測試對 Java 版與 Go 版都要綠。這是唯一的證據。
 
 3. **知道無聲失敗長什麼樣。**
-   [`AGENTS.md` §2](AGENTS.md) 累積了 29 條地雷，其中多數的共同點是
+   [`AGENTS.md` §2](AGENTS.md) 累積了 31 條地雷，其中多數的共同點是
    **完全沒有錯誤訊息**——健康檢查過、日誌乾淨、指標正常，就是不動作。
 
 4. **能誠實地報告代價。**
@@ -105,10 +115,12 @@ docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env down
 | 檔案 | 內容 |
 |---|---|
 | [`docs/藍圖.md`](docs/藍圖.md) | **單一真相來源**：取捨原則、技術選型、重寫順序、時間估計 |
-| [`AGENTS.md`](AGENTS.md) | AI 與人類開工前必讀：29 條地雷、約定、驗證指令 |
+| [`AGENTS.md`](AGENTS.md) | AI 與人類開工前必讀：31 條地雷、約定、驗證指令 |
 | [`CLAUDE.md`](CLAUDE.md) | AI 協作準則（教學模式、規模相稱的抽象、測試先行） |
 | [`docs/ADR-000`](docs/ADR-000-為什麼現在改用-Go.md) | 為什麼現在改用 Go |
 | [`docs/ADR-001`](docs/ADR-001-資料層-MySQL-與-MongoDB.md) | 資料層：MySQL + MongoDB |
+| [`docs/ADR-002`](docs/ADR-002-wallet-帳務語句在-MySQL-的等價實作.md) | 帳務語句在 MySQL 的等價實作（沒有 `RETURNING` 怎麼辦） |
+| [`docs/ADR-003`](docs/ADR-003-schema-migration-以-goose-管理.md) | schema migration：goose，且不在啟動時自動跑 |
 | [`.claude/agents/`](.claude/agents/README.md) | 三個 subagent 與「為什麼是三個」 |
 
 ---

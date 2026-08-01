@@ -92,13 +92,50 @@ type Infra struct {
 	Redis Redis
 }
 
+// LoadMySQL 只載入帳務寫入主庫的設定。
+//
+// 為什麼要跟 LoadInfra 分開：`cmd/migrate` 只碰 MySQL。走 LoadInfra 的話，
+// 忘了設 `MONGO_ROOT_PASSWORD` 會讓 migrate 拒絕啟動，而那個錯誤訊息與它
+// 要做的事完全無關——「錯誤訊息指不到真因」正是本專案最想避免的形狀。
+func LoadMySQL() (MySQL, error) {
+	var errs []error
+
+	port, err := intEnv("MYSQL_PORT", 3308)
+	errs = append(errs, err)
+
+	cfg := MySQL{
+		Host:     stringEnv("MYSQL_HOST", "localhost"),
+		Port:     port,
+		User:     os.Getenv("MYSQL_USER"),
+		Password: os.Getenv("MYSQL_PASSWORD"),
+		Database: stringEnv("MYSQL_DATABASE", "lucky_star_casino"),
+
+		// 保守的起始值。真正的數字要壓測後才知道（藍圖 §3.4），
+		// 現在寫死是為了「顯式優於隱式」，不是因為量過。
+		MaxOpenConns:    25,
+		MaxIdleConns:    25,
+		ConnMaxLifetime: 30 * time.Minute,
+	}
+
+	// 密碼沒有合理的預設值——給預設等於讓「忘了設」變成一個能跑起來的狀態，
+	// 然後在連線時才失敗，而那時候的錯誤訊息指不到這裡。
+	if cfg.User == "" {
+		errs = append(errs, errors.New("MYSQL_USER 未設定"))
+	}
+	if cfg.Password == "" {
+		errs = append(errs, errors.New("MYSQL_PASSWORD 未設定"))
+	}
+
+	return cfg, errors.Join(errs...)
+}
+
 // LoadInfra 從環境變數讀取設定並驗證。
 //
 // 回傳的 error 可能包含多個問題（errors.Join）——一次看完比修一個跑一次快。
 func LoadInfra() (Infra, error) {
 	var errs []error
 
-	mysqlPort, err := intEnv("MYSQL_PORT", 3308)
+	mysqlCfg, err := LoadMySQL()
 	errs = append(errs, err)
 	mongoPort, err := intEnv("MONGO_PORT", 27018)
 	errs = append(errs, err)
@@ -106,19 +143,7 @@ func LoadInfra() (Infra, error) {
 	errs = append(errs, err)
 
 	cfg := Infra{
-		MySQL: MySQL{
-			Host:     stringEnv("MYSQL_HOST", "localhost"),
-			Port:     mysqlPort,
-			User:     os.Getenv("MYSQL_USER"),
-			Password: os.Getenv("MYSQL_PASSWORD"),
-			Database: stringEnv("MYSQL_DATABASE", "lucky_star_casino"),
-
-			// 保守的起始值。真正的數字要壓測後才知道（藍圖 §3.4），
-			// 現在寫死是為了「顯式優於隱式」，不是因為量過。
-			MaxOpenConns:    25,
-			MaxIdleConns:    25,
-			ConnMaxLifetime: 30 * time.Minute,
-		},
+		MySQL: mysqlCfg,
 		Mongo: Mongo{
 			Host:     stringEnv("MONGO_HOST", "localhost"),
 			Port:     mongoPort,
@@ -132,14 +157,7 @@ func LoadInfra() (Infra, error) {
 		},
 	}
 
-	// 密碼沒有合理的預設值——給預設等於讓「忘了設」變成一個能跑起來的狀態，
-	// 然後在連線時才失敗，而那時候的錯誤訊息指不到這裡。
-	if cfg.MySQL.User == "" {
-		errs = append(errs, errors.New("MYSQL_USER 未設定"))
-	}
-	if cfg.MySQL.Password == "" {
-		errs = append(errs, errors.New("MYSQL_PASSWORD 未設定"))
-	}
+	// MySQL 的必填由 LoadMySQL 驗過了，這裡只補 Mongo 的。
 	if cfg.Mongo.User == "" {
 		errs = append(errs, errors.New("MONGO_ROOT_USER 未設定"))
 	}
