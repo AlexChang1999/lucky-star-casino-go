@@ -41,7 +41,7 @@ func openDB(t *testing.T) (*gorm.DB, context.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	t.Cleanup(cancel)
 
-	db, err := platformstore.OpenMySQL(ctx, cfg.MySQL)
+	db, err := platformstore.OpenMySQL(ctx, cfg.MySQL, nil)
 	if err != nil {
 		t.Fatalf("連 MySQL 失敗: %v", err)
 	}

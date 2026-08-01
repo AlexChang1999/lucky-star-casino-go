@@ -5,6 +5,204 @@
 
 ---
 
+## [feat] — 2026-08-02 — wallet HTTP 層與 `cmd/wallet`：第一個跑得起來的服務
+
+Phase A 的第四個切片。到這一輪為止 wallet 一直是「一包函式」，
+現在它第一次是一個**服務**——有埠、有端點、有開機自檢、會優雅關機。
+這也是契約測試唯一的前提：在這之前沒有東西可以打。
+
+Kafka／outbox poller／玩家端點（`/api/v1/wallet/**`）仍未實作。
+
+**Added**
+
+- **`internal/wallet/httpapi`——HTTP 邊界**（`POST /internal/wallet/debit` 與
+  `/credit`）。端點路徑、回應信封、狀態碼、**訊息文字**全部逐字對齊 Java，
+  來源是逐檔讀過的 `InternalWalletController`、`GlobalExceptionHandler`、
+  `ApiResponse`、`InternalSecretFilter`。
+- **`cmd/wallet`——服務進入點**。依賴用**明確傳參**組裝，不引入 wire/fx/dig
+  （CLAUDE.md §2）：設定 → 連線 → 開機自檢 → repository → handler → 伺服器，
+  由上往下讀一次就看得完。
+- **`internal/platform/store.NewGormLogger`——把 GORM 的 SQL 導進 slog**。
+  這結掉 debit 那一輪記下的待辦（「`db.Debug()` 尚未接上，因為還沒有 `cmd/wallet`」）。
+  ⚠️ 不用 `db.Debug()` 是因為那是**全域**開關且輸出是純文字；本專案的 log 一律
+  走結構化輸出，SQL 要能當欄位被 grep。實測輸出含 `sql` / `rows` / `elapsedMs`
+  ——其中 **`rows` 是最重要的欄位**：帳務的條件扣款與樂觀鎖靠的就是「受影響列數
+  是不是 1」（地雷 #3），事後查帳時一筆 `rows=0` 的 UPDATE 就是全部的答案。
+- **`config.LoadWallet` / `config.HTTPServer` / `config.LoadLogLevel`**。
+  `http.Server` 的四個逾時全部顯式設定——它的零值是「**永不逾時**」，
+  這是 Go 相對 Spring Boot 最容易吃虧的地方（Tomcat 有一整組預設值，Go 沒有）。
+
+**⭐ 最重要的一條：餘額不足是 422，不是 400**
+
+切片規格原本寫「`ErrInsufficientBalance` → 400」。
+`GlobalExceptionHandler:23-27` 明寫 `@ResponseStatus(HttpStatus.UNPROCESSABLE_ENTITY)`
+——**是 422**。語義上也說得通：JSON 語法對、欄位全部合法，是**業務狀態**不允許，
+那正是 422 與 400 的分界。實作照 Java（CLAUDE.md §5：等價 > 品味）。
+
+完整對照（每一格都來自原始碼，不是直覺）：
+
+| Java 例外 | 狀態 | 訊息 |
+|---|---|---|
+| `WalletNotFoundException` | 404 | `Wallet not found for player: {id}` |
+| `InsufficientBalanceException` | **422** | `Insufficient balance` |
+| `ObjectOptimisticLockingFailureException` | 409 | `Concurrent modification detected, please retry` |
+| `MethodArgumentNotValidException` | 400 | `Invalid request: {field} {message}` |
+| 其餘（含 `IllegalStateException`） | 500 | `Internal server error` |
+
+**⭐ 規格漏掉的一項：`/internal/**` 有 `X-Internal-Secret` 保護**
+
+Java 的 `InternalSecretFilter` 對所有 `/internal/` 開頭的路徑驗一個共享 secret，
+不符就回 401 `{"success":false,"data":null,"message":"Unauthorized"}`。
+沒做的話 Go 版會在契約測試第一格就紅，而且是**安全性方向**的漂移。已補上：
+
+- 定值時間比對（`subtle.ConstantTimeCompare`，對齊 Java 的 `MessageDigest.isEqual`）。
+  用 `==` 的話攻擊方可以靠反覆計時把 secret 一個位元組一個位元組猜出來。
+- ⚠️ 中介層掛**全域**而不是掛 gin 的路由群組。掛群組的話
+  `POST /internal/wallet/nope` 會直接落到 404 而**不經過驗證**，
+  於是沒有 secret 的人可以用「401 還是 404」探測哪些內部端點存在。有測試釘住。
+- `INTERNAL_SECRET` 為空一律拒絕啟動：空 secret 會讓
+  `ConstantTimeCompare` 對「同樣沒帶 header」的請求回 1 —— `/internal/**`
+  對全世界敞開，而服務看起來、log 看起來、健康檢查看起來全部正常。
+
+**⭐ 地雷 #33 在 HTTP 層的第二個入口：請求 DTO 也必須用指標**
+
+之前只在**回應**與 DB 欄位上處理過 `""` vs `null`。這一輪發現**請求**這一側
+更陰險，因為 Java 的 `Long` / `String` 分得出 null，而 Go 的零值分不出：
+
+| 請求 | Java | Go 用 `int64`/`string` 會變成 |
+|---|---|---|
+| `{"amount": null}` | 400 `amount must not be null` | 與 `amount: 0` 無法區分 |
+| `{"amount": 0}` | 400 `amount must be greater than 0` | 同上，**兩個錯誤變成一個** |
+| debit 不帶 `subType` | 預設 `BET` | 與下一列無法區分 |
+| debit 帶 `{"subType": ""}` | 400（@Pattern 不符） | **被當成 BET 記成一筆下注** |
+
+最後一列是真正危險的那個：**一筆本該被拒絕的請求會靜靜地變成一筆合法的扣款**。
+解法是選填欄位一律 `*int64` / `*string`，並有表格測試逐格釘住。
+
+同一類還有兩條 domain 表達不了、少了就會出事的規則：
+- `@NotBlank` 是 **trim 之後**不可為空，而 domain 只擋 `""`——
+  少了 HTTP 層這一條，`"idempotencyKey": "   "` 會變成一把由三個空白組成的
+  合法冪等鍵，而且真的會被寫進帳務流水。
+- `referenceId` 的 `@Size(max=100)` **沒有任何一層擋**（domain 不管它、
+  DB 是 VARCHAR(100)）——101 字元會撞 MySQL 1406 → 500，而 Java 是 400。
+
+**Changed**
+
+- **`platformstore.OpenMySQL` 多一個 `gormlogger.Interface` 參數**（傳 nil 走原本的
+  Warn 等級）。兩個既有呼叫端都是測試，改動範圍就是這兩行。
+- **`AGENTS.md` §3 埠表**新增 wallet 8182，並訂下「業務服務的埠 = Java 版 + 100」。
+  ⚠️ 不走 notify-go 那套「+1」：那邊只搬一個服務，本專案七個都要並存，
+  而團隊已占滿 8080–8087、notify-go 又占了 8088，+1 一定撞。
+- **`AGENTS.md` §4** 新增跑 wallet 的指令，並記下「錢包不會被 HTTP 建出來」。
+- **`docs/藍圖.md` §5** 新增第 9、10 條（見下）。
+
+**刻意的分歧（進了藍圖 §5，不是無聲漂移）**
+
+1. **壞 JSON：Java 500 → Go 400**。`GlobalExceptionHandler` 沒有處理
+   `HttpMessageNotReadableException`，但它註冊了 `@ExceptionHandler(Exception.class)`，
+   於是 `ExceptionHandlerExceptionResolver` 會搶在 Spring 內建、真正會回 400 的
+   `DefaultHandlerExceptionResolver` 之前接住它。「呼叫端送壞 JSON，
+   伺服器說自己壞了」是缺陷不是契約。
+   ⚠️ **這條的 Java 行為是讀原始碼推導的，尚未對跑起來的實例複驗**，
+   契約測試建起來時要當第一批確認項目。
+2. **`playerId: 0` 或負數：Java 404 → Go 400**。Java 的 `playerId` 只有
+   `@NotNull` 沒有 `@Positive`，非法 ID 會一路走到「查不到錢包」。
+3. **`{"referenceId": ""}`：Java 存 `''` → Go 存 `NULL`**。
+   這是 debit 那一輪 `domain.OptionalString` 決策的延伸（地雷 #33），
+   已由 `TestDebitEmptyReferenceIDBecomesNull` 釘住。**未帶**的情況兩邊一致（NULL）。
+
+**看起來像抄錯、其實是對的：`subType subType`**
+
+Java 的 `handleValidation` 組訊息的方式是
+`"Invalid request: " + fe.getField() + " " + fe.getDefaultMessage()`，
+而 `CreditRequest` 的自訂 `@Pattern` 訊息本身就以欄位名開頭，
+於是真實輸出是 `Invalid request: subType subType must be one of ...`——**欄位名兩次**。
+Go 版把它做成 `(field, message)` 兩個欄位再串起來，讓這個重複是**結構造成的**，
+而不是某個人手抄了一句奇怪的訊息。順手修掉就是行為漂移。
+
+**如何驗證**
+
+```
+gofmt -l .                                # 無輸出
+go vet ./... && go vet -tags=infra ./...  # OK
+go build ./...                            # OK
+golangci-lint run                         # 0 issues
+go test -race -count=1 ./...              # 全綠
+go test -race -tags=infra -count=1 ./...  # 全綠（wallet/store 26.3s）
+go test -race -count=5 ./cmd/wallet/...   # 連跑 5 次，無 flake
+```
+
+新增 3 個測試檔、9 個測試函式（含 3 張表格共 26 格）：
+
+| 測試 | 釘住的主張 |
+|---|---|
+| `TestDebitSuccess` / `TestCreditSuccessCarriesFrozenAfter` | 回應**逐位元組**比對——有人加 `omitempty` 就會紅 |
+| `TestCreditIdempotentHitReturnsNullFrozenAfter` | 冪等命中回 `"frozenAfter":null` 而不是 `0`（地雷 #33） |
+| `TestStoreErrorMapping`（5 格） | ⭐ 錯誤 → 狀態碼，含 422 那一格 |
+| `TestValidation`（16 格） | 逐條對齊 Bean Validation，且**驗證失敗絕不可碰到帳務層** |
+| `TestMalformedBodyIsRejected`（4 格） | 壞 JSON / 空 body / 型別錯 / int64 溢位 |
+| `TestInternalSecret`（5 格） | 401 的四種情況 + healthz 放行；未通過驗證時 store 呼叫數必須是 0 |
+| `TestServeGracefulShutdown` | ⭐ 見下 |
+| `TestServeReportsListenFailure` | 埠被占用要當成**啟動失敗**，不是 log 一行就算了 |
+
+⭐ **`TestServeGracefulShutdown` 是刻意補的，因為本機 smoke test 測不到它**：
+Windows 沒有真正的 signal，Git Bash 的 `kill -TERM` 對原生 exe 走的是
+`TerminateProcess`，Go 的 handler 根本不會跑（實測 smoke test 收到 exit 143，
+關機日誌一行都沒有）。也就是說「本機測過了」完全不代表關機路徑是對的，
+而它在 Linux 容器裡每次部署都會走到。這個測試繞過 signal 直接取消 context，
+順便當 `context.WithoutCancel` 的回歸測試——少了它，shutdown 用的 context
+一出生就是 done，`Shutdown` 立刻放棄、in-flight 的請求被硬斷，
+而且**沒有任何錯誤訊息**。
+
+⚠️ 寫這個測試時撞到一條平台差異：Windows 允許 `0.0.0.0:P` 與 `127.0.0.1:P`
+同時存在，所以拿 `127.0.0.1` 去占埠，`serve`（綁 `:P`）照樣綁得起來 →
+`TestServeReportsListenFailure` 不會拿到錯誤，而是真的開始服務並卡在 select 上，
+**測試永遠跑不完**。已改成兩邊都用 wildcard，並加了逾時保險。
+
+**Smoke test（真的連上 MySQL 8.4.10 的 compose 環境）**
+
+```
+healthz                       200
+debit 沒帶 secret              401 {"success":false,"data":null,"message":"Unauthorized"}
+debit 300                     200 balanceBefore=5000 balanceAfter=4700 idempotent=false
+debit 重送同鍵                 200 同一個 transactionId=73，idempotent=true
+credit 1000 (WIN)             200 balanceAfter=5700 frozenAfter=0
+credit 重送同鍵                200 frozenAfter=null（地雷 #33）
+debit 999999                  422 Insufficient balance
+debit 不存在的玩家              404 Wallet not found for player: 999002
+credit subType=BET            400 Invalid request: subType subType must be one of WIN/...
+```
+
+事後 DB 狀態：`balance=5700`、`version=2`、**流水恰好 2 筆**（重送沒有多寫）、
+**outbox 恰好 2 筆 PENDING**，payload 逐欄位正確。
+
+**誠實記錄的負面後果**
+
+- 🔶 **契約測試仍然無法建立**，因為 **Java 沒有任何 HTTP 路徑能建出錢包**
+  ——`WalletService.createWallet` 的唯一呼叫端是 `MemberEventListener:30`
+  （`member.registered` 事件），`/api/v1/wallet/balance` 查不到就是 404，沒有
+  lazy-create。所以契約測試要嘛各自直接寫自己的主庫、要嘛先做 `member.registered`
+  的消費者。**這是切片 9 的前置條件，本輪只確認了事實，沒有做決定。**
+- 🔶 **沒有 Dockerfile 與 compose service**。`docker-compose.infra.yml` 的檔頭明寫
+  「只有基礎設施，沒有業務服務」，硬塞進去會違反它存在的理由。
+  目前的跑法是 `go run ./cmd/wallet`。
+- 🔶 **`/api/v1/wallet/**` 玩家端點全部未做**（balance / transactions / gift /
+  bankruptcy-aid），它們要 `X-User-Id` 而不是 `X-Internal-Secret`。
+  其中 gift 與 bankruptcy-aid 是 `docs/notes/` §7 尚未查證的四項之二，
+  **動之前必須回讀 Java 原始碼**（CLAUDE.md §5）。
+- 🔶 **`/healthz` 不是 Java 契約的一部分**。Java 走 Spring Actuator 的
+  `/actuator/health`，這裡刻意不模仿那個 JSON 形狀——為了一個探針把 Actuator
+  的結構搬過來，是把 Spring 的實作細節當成契約。探針路徑由部署設定，不由契約決定。
+- ⚠️ **`golangci-lint --build-tags=infra` 有 1 個既有問題**：
+  `repository_credit_infra_test.go:48` 的 `mustCredit` 從來沒被呼叫過。
+  它在 develop 上就存在（本輪沒動到那個檔）。依 CLAUDE.md §3
+  「發現不相關的死碼**告訴我**，不要擅自刪除」，**留著並記在這裡**。
+- **SQL log 預設開著**（`WALLET_SQL_LOG=true`）是刻意的取捨：帳務要看得見 SQL
+  （藍圖 §3.2），代價是每筆請求多 3~5 行日誌。壓測時要記得關掉，
+  否則量到的會是 log I/O 而不是帳務路徑。
+
+---
+
 ## [feat] — 2026-08-02 — wallet credit：讀改寫 + 樂觀鎖，並補上 Java 版沒有的補償回沖
 
 Phase A 的第三個切片。credit 與 debit **形狀不同**——團隊只對 debit 做過

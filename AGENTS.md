@@ -418,8 +418,15 @@ Memcached、自建區塊鏈節點、冷熱錢包、Vault/KMS、GKE。理由見�
 | **27018** | MongoDB | — | — |
 | **6380** | Redis | 6379 | — |
 | **9095** | Kafka（HOST listener） | 9092 | 9094 |
+| **8182** | wallet HTTP | 8082 | — |
 
 ⚠️ MongoDB 用 27018 而非預設 27017，是把 27017 留給開發者本機自己裝的 MongoDB。
+
+⭐ **業務服務的埠一律是「Java 版 + 100」**：gateway 8180、member 8181、
+wallet 8182、game 8183、rank 8184、admin 8186。
+⚠️ **不走 notify-go 那套「+1」**——那邊 8087 → 8088 之所以可行，是因為它只搬
+一個服務；本專案七個服務全要並存，而團隊已經占滿 8080–8087、notify-go 又占了
+8088，+1 一定撞。**一個好記的位移規則勝過七次個別決定**。
 
 ### 目錄
 
@@ -516,6 +523,22 @@ go test -race -tags=infra ./...
 # 收工。⚠️ 不要隨手加 -v，Redis 是主儲存（地雷 #16）
 docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env down
 ```
+
+**跑起 wallet 服務**（環境變數同上，`deploy/.env` 要有 `INTERNAL_SECRET`）：
+
+```bash
+set -a && . deploy/.env && set +a
+go run ./cmd/wallet                    # 預設 :8182，開機自檢不過就不會起來
+
+curl -s localhost:8182/healthz
+curl -s -X POST localhost:8182/internal/wallet/debit \
+  -H "X-Internal-Secret: $INTERNAL_SECRET" -H 'Content-Type: application/json' \
+  -d '{"playerId":1,"amount":100,"idempotencyKey":"bet-1"}'
+```
+
+⚠️ **玩家的錢包不會被 HTTP 建出來**。Java 版只有 `member.registered` 事件會呼叫
+`WalletService.createWallet`（`MemberEventListener:30`），沒有任何端點做 lazy-create
+——`/api/v1/wallet/balance` 查不到就是 404。手動測試要自己 `INSERT INTO wallets`。
 
 **規則**：
 - **改 schema 一律是「加一個新的 migration 檔」**，不是去改既有的那個。
