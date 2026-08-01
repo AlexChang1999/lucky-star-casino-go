@@ -44,20 +44,6 @@ func readWalletFull(t *testing.T, e *testEnv, playerID int64) (balance, frozen, 
 	return balance, frozen, version
 }
 
-// mustCredit 是「這次入帳預期要成功」的簡寫。
-func mustCredit(t *testing.T, e *testEnv, playerID int64, amount domain.Amount, key string) CreditResult {
-	t.Helper()
-	m, err := domain.NewCredit(playerID, amount, domain.SubTypeWin, key, "", 0)
-	if err != nil {
-		t.Fatalf("建立入帳意圖失敗: %v", err)
-	}
-	res, err := e.repo.Credit(e.ctx, m)
-	if err != nil {
-		t.Fatalf("入帳失敗: %v", err)
-	}
-	return res
-}
-
 // requireStillBlocked 確認被測交易在 d 之後**仍未結束**——也就是真的卡在對手的行鎖上。
 //
 // ⚠️ 為什麼不查 information_schema.innodb_trx 之類的鎖視圖：**本機實測查不到**

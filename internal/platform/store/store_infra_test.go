@@ -36,7 +36,8 @@ func TestOpenMySQL(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	db, err := OpenMySQL(ctx, cfg.MySQL)
+	// gormLog 傳 nil：這裡測的是連線與連線池，不是 SQL 日誌。
+	db, err := OpenMySQL(ctx, cfg.MySQL, nil)
 	if err != nil {
 		t.Fatalf("連 MySQL 失敗: %v", err)
 	}

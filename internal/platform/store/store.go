@@ -26,16 +26,19 @@ import (
 
 // OpenMySQL 連上帳務寫入主庫並套用連線池設定。
 //
+// gormLog 傳 nil 時只留警告與錯誤。帳務服務要傳 NewGormLogger(logger, true)
+// 把 SQL 攤開——冪等鍵與樂觀鎖正是「ORM 最容易騙人」的地方
+// （藍圖 §3.2、docs/ADR-001 後果第 2 點）。
+//
 // ⚠️ GORM 的 Open **不會真的建立連線**（database/sql 是惰性的），
 // 所以這裡明確 Ping 一次。少了它，設定錯誤要等到第一個查詢才爆，
 // 而那時候的堆疊指向業務程式碼，不是這裡。
-func OpenMySQL(ctx context.Context, cfg config.MySQL) (*gorm.DB, error) {
+func OpenMySQL(ctx context.Context, cfg config.MySQL, gormLog gormlogger.Interface) (*gorm.DB, error) {
+	if gormLog == nil {
+		gormLog = gormlogger.Default.LogMode(gormlogger.Warn)
+	}
 	db, err := gorm.Open(mysql.Open(cfg.DSN()), &gorm.Config{
-		// 預設的 logger 會把每一條 SQL 印出來，在正式環境是雜訊也是效能負擔。
-		// ⚠️ 但帳務服務要反過來——見 docs/ADR-001 後果第 2 點，
-		// 那裡要 db.Debug() 把 SQL 攤開，因為冪等鍵與樂觀鎖正是
-		// 「ORM 最容易騙人」的地方。
-		Logger: gormlogger.Default.LogMode(gormlogger.Warn),
+		Logger: gormLog,
 		// 命名策略走 GORM 預設（表名自動複數化）。這剛好對得上團隊 repo
 		// 的既有表名——wallets、wallet_transactions、game_rounds 都是複數，
 		// 所以不需要覆寫。⚠️ 遇到不是這個形狀的表名時要在該 model 上
