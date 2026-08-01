@@ -33,13 +33,16 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 | 1 | `docs/藍圖.md` | **單一真相來源**：取捨原則、技術選型、重寫順序、Phase DoD |
 | 2 | 本檔 §2 已知地雷 | 不讀會浪費時間、而且多數**沒有錯誤訊息**的坑 |
 | 3 | `docs/ADR-*.md` | 已拍板的架構決策（含推翻團隊 ADR 的理由） |
-| 4 | `README.md` | 對外門面 |
+| 4 | `docs/notes/` | **動 wallet / gateway / rank 之前必讀**：團隊 Java 版的實地查證筆記（Outbox 資料流、Redis key inventory）。⚠️ 它們用**團隊的**雷區編號，對照表在 `docs/notes/README.md` |
+| 5 | `README.md` | 對外門面 |
 
 **參考來源（唯讀）**：
 - **團隊 Java repo**：`H:\Lucky_Star_Casino\`（單層，`backend/` 直接在底下）
   ⚠️ **這個路徑會隨機器改變，開工前先 `ls` 確認**。前身專案的同一行被改錯過兩次。
   它是**唯讀參考**：可以在本機跑起來、可以改本機 `.env`，
   但**不提交任何 commit、不開 PR**。所有產出留在本 repo。
+  💡 **先查 `docs/notes/`**——常見的帳務與 Redis 問題已經查證過並標了行號，
+  不必每次都重掃 555 個 `.java` 檔。
 - **前身 Go repo**：`H:\Lucky_Star_Notify_Go\`（notification 的完成品 + 28 條地雷）
 
 ---
@@ -49,7 +52,7 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 > **A 類（#1–#17）是從團隊 repo 原封不動帶走的**——它們看起來像「Java 專案的事」，
 > 其實是業務與架構本質，換語言一樣會踩。**這一類最容易漏。**
 > **B 類（#18–#25）是前身 Go 專案實際踩過的**，已驗證適用於 Go。
-> **C 類（#26–#29）是本專案新增的。**
+> **C 類（#26–#30）是本專案新增的。**
 > 之後真的踩到新雷，**當場往下加**（§5）。
 
 ### A 類：業務與架構本質（語言無關，必須全部帶走）
@@ -63,6 +66,8 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 2. **`wallet.credit` 是「事件」、`wallet.credit.request` 才是「指令」**：
    搞反會造成**無限迴圈**——listener 收到自己發出的事件又觸發自己。
    （團隊 ADR-002 明訂這個分離，語義與語言無關。）
+   📖 事故經過與「唯一安全的例外」（read-sync 為什麼可以消費自己的事件）：
+   `docs/notes/Java版-CQRS-與指令事件分離.md`。
 
 3. **帳務＝冪等 + 防超扣，這是核心中的核心**：
    - 冪等鍵走 **UNIQUE 索引衝突**，不是先 SELECT 再 INSERT（那有 race）
@@ -77,10 +82,19 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 5. **wallet 事件走 Transactional Outbox，勿改回直接 send**：
    重構時很容易「順手簡化」掉它——但直接 send 意味著「DB 交易成功、
    送 Kafka 失敗」時事件永遠遺失，而餘額已經變了。
+   ⚠️ 附帶一個容易漏的維運面：**outbox 的列投遞成功只標 SENT、從不刪除**，
+   這張表單向成長，要配一支清理排程。**只刪 SENT，PENDING 無論多舊都不能刪**
+   （刪掉就是無聲丟失事件，正是 Outbox 要防的事）。
+   📖 完整資料流與「為什麼不同步雙寫」的四個理由：
+   `docs/notes/Java版-CQRS-與指令事件分離.md`。
 
 6. **消費端「非冪等累加」必須去重，「冪等寫入」則不可去重**：
    兩者搞反都會錯。累加型（例如統計）重複消費會多算；
    冪等寫入型（例如以主鍵 upsert）加了去重反而讓正常重放失效。
+   **判準一句話**：問「這個操作重做一次會不會出錯？」不會 → 不要去重；會 → 才去重。
+   ⚠️ 冪等操作加去重的具體災難：`ZADD` 寫入成功但進程在 ack 前崩潰 → 重送被去重標記
+   擋掉 → **值永久停在錯的中間態**，是去重機制自己製造的資料錯誤。
+   📖 `ZADD` vs `ZINCRBY` 的實例：`docs/notes/Java版-Redis-用途全解.md` §3.2。
 
 7. **`friend.relationship.updated` 是「完整清單」事件，不是增量**：
    當成增量處理會讓好友列表越積越多。事件語義看錯就是資料錯。
@@ -116,6 +130,8 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     - 捕魚 session —— Lua CAS 樂觀鎖（團隊 ADR-008，**腳本可原樣搬過來**）
     - `disabled:player:*` 後台停用標記 —— 無 TTL，清空等於所有停用玩家自動解封
     ⚠️ 所以 `docker compose down -v` 會**砍掉業務資料**。
+   📖 全部 key 的 inventory（型別 / TTL / 讀寫方）、JWT 撤銷三件套、
+   fail-open vs fail-closed 的判準：`docs/notes/Java版-Redis-用途全解.md`。
 
 17. **舊 DB volume 缺 migration 會讓服務開機即死**：
     與語言無關的維運坑。換 schema 時要嘛跑 migration，要嘛砍 volume 重建。
@@ -179,6 +195,11 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     MySQL 要靠 `LastInsertId()`。
     ⚠️ **批次插入時 `LastInsertId()` 回的是第一筆的 id**，不是最後一筆——
     照 PG 的直覺寫會拿到錯的關聯。
+    📖 wallet 的 debit 熱路徑正好把 `RETURNING` 用在最關鍵的位置，
+    三條語句的等價實作與取捨見 `docs/ADR-002`。
+    ⚠️ 也**不要**用 `INSERT IGNORE` 當 `ON CONFLICT DO NOTHING` 的替代品：
+    它把截斷、NOT NULL、外鍵違反**全部**降級成警告，於是壞資料靜默變成
+    no-op 而餘額已經扣掉了。正解是捕捉錯誤碼 `1062`（ER_DUP_ENTRY）。
 
 27. **MongoDB 讀端是「衍生資料」，絕不可成為任何資料的唯一真相**：
     讀模型由 Kafka 事件投影而成，壞掉就重放重建，因此**沒有備份需求**。
@@ -196,6 +217,28 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     連結階段會在空白處斷成兩截，錯誤訊息是
     `C:/Users/Alex: file not recognized`——**看起來像目的檔壞掉，其實是路徑被切開**。
     解法見 §4「Windows 本機環境」。⚠️ 8.3 短檔名與 junction **都無效**。
+
+30. **⭐ MySQL 的預設定序不分大小寫，會同時弱化冪等鍵與列舉約束**：
+    MySQL 8.4 預設 `utf8mb4_0900_ai_ci`——**ai = 不分音標、ci = 不分大小寫**。
+    PostgreSQL 的預設定序區分大小寫，所以團隊 Java 版從來沒遇過這兩件事：
+    - **UNIQUE 冪等鍵被弱化**：`checkin-42` 與 `CHECKIN-42` 在索引裡是同一把鍵。
+      兩把本來不同的鍵被判定重複 → 第二筆被當成「冪等命中」跳過 → **少入一筆帳**。
+      更陰險的是 ai：`e` 與 `é` 也相等。
+    - **`CHECK ... IN (...)` 列舉被弱化**：`CHECK (type IN ('DEBIT',...))`
+      **放行小寫 `'debit'`** 並原樣存入 → Go 端 `tx.Type == "DEBIT"` 是 false、
+      事件 payload 帶著小寫進 Kafka、下游 switch 落到 default。
+      PostgreSQL 會在 INSERT 當場拒絕。
+
+    兩者的共同點是**沒有任何錯誤訊息可以指認真因**。
+    解法：帳務表裡「參與相等性判定或列舉約束」的字串欄位一律
+    `COLLATE utf8mb4_bin`（見 `deploy/mysql/init/01-wallet-schema.sql`）。
+    ⚠️ **不要改全域預設**——暱稱、商品名稱這類欄位**應該**是 ci 的
+    （搜尋「Alex」要找得到「alex」）。定序是 per-column 的正確性選擇。
+    ⚠️ DSN 裡的 `collation=` 是**連線定序**，管不到欄位：比對時欄位定序
+    （coercibility 2）優先於字面值的連線定序（coercibility 4）。
+    設了連線定序不代表你安全了。
+    已於 2026-08-01 對 MySQL 8.4.10 實測驗證兩個方向，並由
+    `internal/wallet/store/schema_infra_test.go` 釘住。
 
 ---
 
@@ -242,8 +285,9 @@ Memcached、自建區塊鏈節點、冷熱錢包、Vault/KMS、GKE。理由見�
 cmd/<service>/        每個服務一個 main
 internal/<service>/   各服務私有實作
 internal/platform/    跨服務共用（設定、DB 連線、log、Kafka）
-deploy/               compose 與部署設定
+deploy/               compose 與部署設定（含 mysql/init 的 schema SQL）
 docs/                 藍圖與 ADR
+docs/notes/           團隊 Java 版的實地查證筆記（唯讀參考，非本專案設計）
 test/contract/        跨語言黑箱契約測試（同一份對 Java 與 Go 都跑）
 test/load/            Go 自寫壓測 client
 ```

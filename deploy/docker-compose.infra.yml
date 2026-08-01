@@ -69,6 +69,10 @@ services:
       start_period: 20s
     volumes:
       - casino_go_mysql_data:/var/lib/mysql
+      # ⚠️ 官方映像**只在 volume 全新時**跑 initdb.d（地雷 #17）。
+      # volume 已存在時改這裡的 .sql 完全沒有效果，而且不會有任何提示——
+      # 症狀是第一筆下注才炸。手動套用方式寫在 01-wallet-schema.sql 檔頭。
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
     networks:
       - casino-go-network
 

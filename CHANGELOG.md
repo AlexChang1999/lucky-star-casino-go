@@ -5,6 +5,89 @@
 
 ---
 
+## [feat] — 2026-08-01 — Phase A 起步：wallet 帳務 schema 與 domain 契約
+
+Phase A（wallet 重構）的第一個切片。**還沒有任何業務端點**——
+這一輪做的是「把已經定死的正確答案抄下來，並讓測試釘住它」。
+
+**Added**
+
+- **`docs/notes/`——團隊 Java 版的實地查證筆記**（3 份）。
+  兩份是既有筆記搬入（CQRS／指令事件分離、Redis 用途全解），
+  一份是本輪新查的（wallet 帳務口徑，含檔名行號）。
+  ⚠️ 它們用的是**團隊的雷區編號**，換算表在 `docs/notes/README.md`——
+  直接把數字抄進本 repo 的文件會指到完全不同的一條。
+- **`deploy/mysql/init/01-wallet-schema.sql`——wallet 三張表**
+  （`wallets` / `wallet_transactions` / `wallet_outbox`），
+  由團隊 `database/postgres/init.sql` 逐欄位翻譯。
+- **`internal/wallet/domain`——帳務型別與規則**（純函式，不碰 DB）。
+  `Amount` 是具名型別而不是 `int64`：wallet 的簽章裡到處是 int64
+  （playerID／amount／balance／version／txID），具名型別讓「參數順序寫反」
+  **編譯不過**。Java 要做到同樣的事得包 value object，成本高到大家都不做。
+- **`internal/wallet/store.VerifyWalletSchema`——開機自檢**。
+  MySQL 官方映像的 `initdb.d` **只在 volume 全新時執行**（地雷 #17），
+  在既有 volume 上改 `.sql` 完全沒有效果也沒有提示。自檢讓這件事
+  在**開機時**失敗，而不是等到第一筆下注。
+- **`docs/ADR-002`——帳務語句在 MySQL 的等價實作**。
+- **地雷 #30**（見下）。
+
+**Changed**
+
+- **`AGENTS.md`**：新增地雷 #30、擴充 #26（`INSERT IGNORE` 的否決理由）、
+  §1 必讀清單加入 `docs/notes/`、#2 / #5 / #6 / #16 補上筆記交叉引用。
+- **`docs/藍圖.md`**：§6 與 §8 加入 `docs/notes/` 的指路。
+- **`deploy/docker-compose.infra.yml`**：MySQL 掛載 `./mysql/init`。
+
+**⭐ 地雷 #30：MySQL 預設定序不分大小寫，會同時弱化冪等鍵與列舉約束**
+
+這是本輪最有價值的發現，**不在原本的預期內**，是實作時實測撞出來的。
+MySQL 8.4 預設 `utf8mb4_0900_ai_ci`（不分音標、不分大小寫），
+PostgreSQL 的預設區分大小寫，於是換庫之後多了兩個**兩邊都不報錯**的破口：
+
+1. `checkin-42` 與 `CHECKIN-42` 在 UNIQUE 索引裡是同一把冪等鍵
+   → 第二筆入帳被當成「冪等命中」跳過 → **少入一筆帳**
+2. `CHECK (type IN ('DEBIT',...))` **放行小寫 `'debit'`** 並原樣存入
+   → Go 端字串比對失敗、事件 payload 帶著小寫進 Kafka、下游 switch 落到 default
+
+解法是帳務表的相關字串欄位一律 `COLLATE utf8mb4_bin`。
+⚠️ **不改全域預設**——暱稱、商品名稱這類欄位**應該**是 ci 的。
+⚠️ DSN 裡的 `collation=` 是連線定序，比對時欄位定序優先，**管不到這件事**。
+
+**如何驗證**
+
+```
+gofmt -l .                                    # 無輸出
+go vet ./...                                  # OK
+go build ./...                                # OK
+go test -race ./...                           # ok domain 1.464s / config
+go test -race -tags=infra ./internal/wallet/  # 5 個測試、3 個子測試全 PASS
+```
+
+`-tags=infra` 那組**實際連上 MySQL 8.4.10** 跑過，逐條釘住 `docs/ADR-002` 的主張：
+
+| 測試 | 釘住的主張 |
+|---|---|
+| `TestVerifyWalletSchema` | schema 真的套用了（定序 / CHECK / UNIQUE） |
+| `TestIdempotencyKeyIsCaseSensitiveInDB` | 地雷 #30 方向一 |
+| `TestSubTypeCheckIsCaseSensitive` | 地雷 #30 方向二 |
+| `TestConditionalDebit` | 條件扣款：足額成功、餘額不足零副作用、冪等命中零副作用 |
+| `TestDupEntryDoesNotAbortTransaction` | InnoDB 的重複鍵是語句級失敗，交易仍可用 |
+
+⚠️ 後面幾項看起來像「在測資料庫而不是測自己的程式」。**是刻意的**：
+它們是 ADR-002 的立論基礎，MySQL 哪天升版行為變了，
+應該是測試先紅，而不是帳先錯。
+
+**誠實記錄的負面後果**
+
+- debit 熱路徑從 Java 版的 **2 次往返變成 3 次**（少了 `RETURNING`，
+  要多一次點查拿扣款後餘額）。壓測數字出來之前，
+  **不可以宣稱「Go 版比 Java 版快」**——這一條就是反例的來源。
+- 🔶 **migration 工具尚未選定**，目前只有一次性建表 SQL。
+  **Phase A 結束前必須補上**，否則第二次改 schema 就會重現團隊那個坑。
+  `VerifyWalletSchema` 是現階段的緩解，不是解法。
+
+---
+
 ## [chore] — 2026-08-01 — 專案骨架、治理層與資料層定案
 
 新 repo 的第一批內容：能跑的基礎設施、連線層、以及**兩份推翻團隊既有決策的 ADR**。
