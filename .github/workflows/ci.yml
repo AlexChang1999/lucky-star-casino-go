@@ -147,12 +147,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 算出映像名稱（GHCR 只吃小寫）
+      - name: 算出映像名稱與 tag
         id: meta
-        # ⚠️ github.repository 是 AlexChang1999/lucky-star-casino-go，含大寫；
-        # GHCR 的 path 必須全小寫，直接用會被拒絕而訊息只說 "invalid reference format"。
+        # ⚠️ 兩個都是實際踩過的坑，而且訊息都只說 "invalid reference format"：
+        #   ① github.repository 是 AlexChang1999/lucky-star-casino-go，**含大寫**，
+        #      而 GHCR 的 path 必須全小寫。
+        #   ② pull_request 事件的 github.ref_name 是 **"9/merge"**（合併 ref），
+        #      裡面那個斜線在 Docker tag 是非法字元。第一次跑 CI 就是死在這裡。
+        # 所以 tag 分成兩段：sha 永遠有，分支名只在 push（develop/main，沒有斜線）時加。
         run: |
-          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')/${{ matrix.service }}" >> "$GITHUB_OUTPUT"
+          image="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')/${{ matrix.service }}"
+          tags="$image:${{ github.sha }}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tags="$tags,$image:${{ github.ref_name }}"
+          fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -172,9 +182,7 @@ jobs:
             SERVICE=${{ matrix.service }}
             VCS_REF=${{ github.sha }}
           push: ${{ github.event_name == 'push' }}
-          tags: |
-            ${{ steps.meta.outputs.image }}:${{ github.sha }}
-            ${{ steps.meta.outputs.image }}:${{ github.ref_name }}
+          tags: ${{ steps.meta.outputs.tags }}
           # GitHub Actions 的建置快取：Go 的依賴下載與編譯結果跨 run 重用。
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
