@@ -43,7 +43,13 @@ func listenWildcard(t *testing.T) (net.Listener, int) {
 	if err != nil {
 		t.Fatalf("借用埠失敗: %v", err)
 	}
-	return ln, ln.Addr().(*net.TCPAddr).Port
+	// 型別斷言帶 ok：TCP listener 的位址一定是 *net.TCPAddr，但「一定」寫成
+	// 不檢查的斷言時，哪天不成立就是 panic 而不是一句看得懂的失敗訊息。
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener 位址不是 *net.TCPAddr，而是 %T", ln.Addr())
+	}
+	return ln, addr.Port
 }
 
 // freePort 借一個埠再馬上還掉。

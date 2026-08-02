@@ -551,10 +551,33 @@ test/load/            Go 自寫壓測 client
 
 ```bash
 go vet ./...
+go vet -tags=infra ./...   # ⚠️ 不加這行，infra 測試檔的編譯錯誤要等到有人起容器才會發現
 go test -race ./...
-golangci-lint run
+golangci-lint run          # ⚠️ .golangci.yml 已把 infra 寫進 run.build-tags
 go build ./...
 ```
+
+⭐ **這四行 GitHub Actions 會逐字再跑一次**（`.github/workflows/ci.yml`），
+外加一個**起真的 MySQL 與 Kafka** 的 job 跑 `-tags=infra`。
+CI 用的是同一份 `deploy/docker-compose.infra.yml` 與同一份 `.env.example`——
+**不用 Actions 的 `services:` 另外寫一份**，那會變成第二個會漂移的真相，
+而漂移的方向必定是「CI 過了、本機不過」。
+
+⚠️ **為什麼 infra 那個 job 是必要的而不是加分**：不加 `-tags=infra` 時，
+`internal/wallet/store` 顯示的是 **`[no test files]`**——帳務的三條 SQL、
+三個隔離級別、gap lock 死鎖、1062 補償回沖**全部沒有被執行到**，而測試是綠的。
+
+**建映像**（七個服務共用一份 `Dockerfile`，`--build-arg` 選一個）：
+
+```bash
+docker build --build-arg SERVICE=wallet -t casino-go/wallet .
+```
+
+⚠️ 最終映像是 **scratch**，所以**不能 `docker exec` 進去**（沒有 shell）、
+**不能寫 HEALTHCHECK**（沒有 curl）。健康檢查由外面打 `GET /healthz`。
+`CGO_ENABLED=0` 是 scratch 的前提不是效能選項——動態連結的 binary 塞進 scratch
+會啟動即死，而錯誤訊息（`no such file or directory`）指的是找不到**動態連結器**，
+不是找不到執行檔。
 
 **跑起基礎設施**：
 
