@@ -415,10 +415,17 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
       **事件無聲蒸發，而資料庫說已送出**，正是 Outbox 唯一要防的那件事。
     - **`Balancer` 預設是 `&Hash{}`（FNV-1a），與 Java 不相容**。Java 的
       DefaultPartitioner 是 `murmur2(key) % partitions`，kafka-go 對應的是
-      `&Murmur2Balancer{}`。用錯的話同一個 `playerId` 在 Java 版與 Go 版落到
-      **不同 partition**，而重構期間兩版是並存的——同玩家事件橫跨兩個 partition
-      ＝Kafka 唯一的順序保證失效，下游看到的「先扣款後派彩」變成隨機順序。
-      Kafka、producer、consumer 三邊都不會報錯。
+      `&Murmur2Balancer{}`。用錯的話同一個 `playerId` 在兩版落到**不同 partition**。
+      ⚠️ **這條的情境在 2026-08-02 修正過**：開發期間兩版的設定是**完全錯開**的
+      （Java 的 Kafka 在 9092、本專案在 9095，兩個獨立叢集），所以平常撞不到。
+      真正要防的是**切換當下**——灰度、雙寫、或切過去又回退時，兩版會有一段時間
+      對**同一個 topic** 產訊息，那時同玩家事件就橫跨兩個 partition，
+      而 partition 內有序是 Kafka **唯一**的順序保證，跨過去下游看到的
+      「先扣款後派彩」變成隨機順序。Kafka、producer、consumer 三邊都不會報錯。
+      ⚠️ 而且**光是 balancer 一致還不夠**：murmur2 之後要對 partition 數取模，
+      所以同叢集切換的前提還包括「兩邊 partition 數相同」。本專案一律 6，
+      Java 是 6/3/1 三層——低流量 topic 與 DLT **對不上**，要切換得先對齊
+      （決策與代價見 `deploy/docker-compose.infra.yml` 的 `KAFKA_NUM_PARTITIONS`）。
 
     ⚠️ 而 #21 的處方（`BatchSize: 1`）**只適用於低頻單則寫入**。poller 是成批
     寫入，設成 1 會讓每則訊息各自成一個 batch，而每個 partition 一次只送一個 batch
