@@ -87,6 +87,147 @@ func TestIntEnv(t *testing.T) {
 	}
 }
 
+func TestDurationEnv(t *testing.T) {
+	tests := []struct {
+		name     string
+		set      bool
+		value    string
+		fallback time.Duration
+		want     time.Duration
+		wantErr  bool
+	}{
+		{name: "未設定時走預設", set: false, fallback: 200 * time.Millisecond, want: 200 * time.Millisecond},
+		{name: "空字串視同未設定", set: true, value: "", fallback: 200 * time.Millisecond, want: 200 * time.Millisecond},
+		{name: "帶單位的毫秒", set: true, value: "50ms", fallback: time.Second, want: 50 * time.Millisecond},
+		{name: "前後空白要吃掉", set: true, value: "  1s  ", fallback: time.Second, want: time.Second},
+		// ⭐ 這一條是這個 helper 存在的理由：Java 那邊是 poll-interval-ms: 200，
+		// 單位藏在名字裡。純數字若被當成「200 奈秒」（time.Duration 的底層單位）
+		// 就會變成忙碌輪詢，而且沒有任何錯誤訊息。
+		{name: "純數字必須報錯", set: true, value: "200", fallback: time.Second, wantErr: true},
+		{name: "亂寫必須報錯", set: true, value: "soon", fallback: time.Second, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const key = "TEST_DURATION_ENV"
+			if tt.set {
+				t.Setenv(key, tt.value)
+			}
+			got, err := durationEnv(key, tt.fallback)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("預期要有錯誤，卻得到 %s", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("非預期錯誤: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadKafka(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    []string
+		wantErr bool
+	}{
+		{name: "未設定走預設", value: "", want: []string{"localhost:9095"}},
+		{name: "單一位址", value: "kafka:9092", want: []string{"kafka:9092"}},
+		// bootstrap 清單允許多個位址，空白與尾逗號是手寫設定檔的常態，要吃掉。
+		{name: "多位址與空白", value: " a:1 , b:2 ,", want: []string{"a:1", "b:2"}},
+		// 「設了但解析不出東西」是打錯字，不該被靜默當成沒設定。
+		{name: "只有逗號要報錯", value: ",,", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("KAFKA_BOOTSTRAP_SERVERS", tt.value)
+
+			got, err := LoadKafka()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("預期要有錯誤，卻得到 %v", got.Brokers)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("非預期錯誤: %v", err)
+			}
+			if strings.Join(got.Brokers, "|") != strings.Join(tt.want, "|") {
+				t.Errorf("got %v, want %v", got.Brokers, tt.want)
+			}
+		})
+	}
+}
+
+// TestLoadOutboxRejectsHarmlessLookingValues 釘住三個「合法但有害」的設定值。
+//
+// ⭐ 三個都是**不會報錯**的故障，所以只能靠設定驗證擋下來：
+// 0 的輪詢間隔＝忙碌輪詢吃光 CPU 與連線、0 的批次＝LIMIT 0 永遠撈不到東西
+// （outbox 只進不出而服務一切正常）、0 的保留期＝清理排程刪掉剛送出的列。
+func TestLoadOutboxRejectsHarmlessLookingValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+		wantErr bool
+	}{
+		{name: "預設值", env: map[string]string{}},
+		{
+			name:    "輪詢間隔為 0",
+			env:     map[string]string{"WALLET_OUTBOX_POLL_INTERVAL": "0s"},
+			wantErr: true,
+		},
+		{
+			name:    "批次大小為 0",
+			env:     map[string]string{"WALLET_OUTBOX_BATCH_SIZE": "0"},
+			wantErr: true,
+		},
+		{
+			name:    "保留天數為 0",
+			env:     map[string]string{"WALLET_OUTBOX_RETENTION_DAYS": "0"},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// ⚠️ 三個變數一律先清空再套用案例值。少了這一步，開發者
+			// `set -a && . deploy/.env` 之後跑測試會拿到自己機器上的值，
+			// 於是「預設值」這個案例在 CI 綠、在本機紅——最難查的那種失敗。
+			for _, key := range []string{
+				"WALLET_OUTBOX_POLL_INTERVAL",
+				"WALLET_OUTBOX_BATCH_SIZE",
+				"WALLET_OUTBOX_RETENTION_DAYS",
+			} {
+				t.Setenv(key, tt.env[key])
+			}
+			got, err := loadOutbox()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("預期要拒絕，卻通過了: %+v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("非預期錯誤: %v", err)
+			}
+			// 預設值與 deploy/.env.example、與 Java 的 wallet.outbox.* 三處成對。
+			if got.PollInterval != 200*time.Millisecond {
+				t.Errorf("PollInterval = %s, want 200ms", got.PollInterval)
+			}
+			if got.BatchSize != 500 {
+				t.Errorf("BatchSize = %d, want 500", got.BatchSize)
+			}
+			if got.Retention != 7*24*time.Hour {
+				t.Errorf("Retention = %s, want 168h（7 天，與下游去重標記 TTL 對齊）", got.Retention)
+			}
+		})
+	}
+}
+
 func TestLoadInfraReportsAllMissingSecretsAtOnce(t *testing.T) {
 	// 刻意四個必填全部留空。重點不是「會失敗」，而是**一次回報全部**——
 	// 一次修一個、跑一次、再發現下一個，是設定驗證最浪費時間的形狀。

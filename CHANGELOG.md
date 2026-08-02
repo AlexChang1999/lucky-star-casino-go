@@ -5,6 +5,114 @@
 
 ---
 
+## [feat] — 2026-08-02 — outbox poller 與清理排程：Transactional Outbox 的另一半
+
+Phase A 的第五個切片。在這之前 `wallet_outbox` 是**只進不出**的——
+帳務交易把事件寫進去，然後沒有任何東西把它拿出來。
+這一輪補上投遞側，事件第一次真的離開 wallet 進到 Kafka。
+
+**Added**
+
+- **`internal/wallet/outbox`——投遞側**：`Poller`（每 200ms 撈一批送 Kafka）、
+  `Publisher`（kafka-go writer 的包裝）、`Purger`（每天清保留期外的 SENT 列）。
+  ⚠️ 三者都是**一個 goroutine + 一個 timer**，沒有 scheduler 容器——
+  「誰啟動它、它在哪裡跑、什麼時候停」在 `cmd/wallet` 裡一眼看得完。
+- **`internal/wallet/store` 的投遞 SQL**：`PublishPending`（撈取 + 標 SENT +
+  累加 retry_count，同一筆交易）與 `PurgeSentOutbox`（分塊刪除）。
+- **`config.LoadKafka` 與 `config.Outbox`**：`KAFKA_BOOTSTRAP_SERVERS`、
+  `WALLET_OUTBOX_POLL_INTERVAL`（200ms）、`WALLET_OUTBOX_BATCH_SIZE`（500）、
+  `WALLET_OUTBOX_RETENTION_DAYS`（7）。三個數值對齊 Java 的 `wallet.outbox.*`，
+  因為它們是團隊 T-090 壓測（2026-07-23）調出來的，不是隨手填的。
+- **compose 的 `KAFKA_NUM_PARTITIONS: 6`**：自動建立的 topic 預設只有 1 個
+  partition，而 Java 的 `kafka-init.sh` 給高流量 topic 的是 6。
+  ⚠️ 必須在**第一次自動建立之前**設好——事後改 partition 數會改變
+  key → partition 的對應，等於把既有資料的順序保證洗掉。
+
+**⭐ 最重要的一條：投遞交易必須是 READ COMMITTED，否則 poller 會卡住下注**
+
+新增地雷 #37。撈取語句是
+`WHERE status='PENDING' ORDER BY created_at, id LIMIT ? FOR UPDATE SKIP LOCKED`，
+在 MySQL 預設的 REPEATABLE READ 下，它對索引範圍下的是 **next-key lock**。
+poller **追上進度時**（撈到的筆數 < batchSize，也就是常態）會掃到範圍尾端，
+間隙一路鎖到 supremum——而那正是下一筆下注要 INSERT 新 outbox 列的位置。
+於是帳務交易卡在 insert intention lock 上，**卡多久取決於 Kafka 什麼時候 ack**。
+
+⚠️ 症狀是「下注偶爾變慢」，沒有任何錯誤訊息指向 poller。
+這與地雷 #34（debit 自己死鎖）同源，但方向是「**一個背景排程去卡住帳務**」。
+PostgreSQL 沒有 gap lock，所以團隊 Java 版結構上不會踩到。
+
+**驗證**：`TestOutboxClaimIsolationDecidesIfAccountingIsBlocked` 對兩個隔離級別
+各跑一次（RR：帳務 INSERT 撞 1205 鎖等待逾時；RC：正常通過）。
+
+**⭐ 第二條：`FOR UPDATE` 一旦走上 filesort，鎖範圍會悄悄變成全表**
+
+`LIMIT 500` 限制的是**回傳筆數**，不是掃描筆數——而 `FOR UPDATE` 鎖的是掃到的
+每一列。`ORDER BY created_at, id` 之所以不走 filesort，靠的是 InnoDB 的
+secondary index 隱含帶著主鍵（實際排序是 `status, created_at, id`）。
+把那個 `, id` 拿掉或換成別的欄位，**查詢結果完全正確**而鎖範圍變成全部 PENDING 列。
+由 `TestClaimPendingUsesIndexWithoutFilesort` 讀 `EXPLAIN FORMAT=JSON` 釘住。
+
+**⭐ 第三條：kafka-go 的三個預設值（地雷 #38）**
+
+| 欄位 | kafka-go 預設 | 本專案 | 不改的後果 |
+|---|---|---|---|
+| `BatchTimeout` | **1 秒** | 10ms | 批次沒裝滿就壓一秒，而日誌與指標都看不出來（地雷 #21） |
+| `Async` | false（要維持） | false | 改 true 會讓 `WriteMessages` 立刻回 nil → **還沒送出的事件被標 SENT**，七天後被清掉 |
+| `Balancer` | `&Hash{}`（FNV-1a） | `&Murmur2Balancer{}` | 與 Java 的 partitioner 不同 → 同一個 playerId 在兩版落到不同 partition，並存期間順序保證失效 |
+
+⚠️ 而 #21 的處方（`BatchSize: 1`）**只適用於低頻單則寫入**。poller 是成批寫入，
+設成 1 反而會退化成 Java 舊版那個 O(N) 循序等 ack 的瓶頸。成批寫入的正解是
+**大 BatchSize + 小 BatchTimeout**。實測單則訊息端到端 **12.6ms**
+（`TestPublisherDoesNotWaitForBatchTimeout` 印出來的數字，預設值會是 1s 起跳）。
+
+**⭐ 第四條：清理排在 20:00 UTC 而不是 4:00（地雷 #39）**
+
+Java 是 `cron = "0 0 4 * * *"`，而 Spring 的 cron 跑在容器**本地時區**
+（Asia/Taipei）。本專案一律 UTC，照抄那個 4 會變成台北中午十二點跑批次刪除——
+玩家最活躍的時段，而「排在離峰」正是這個排程唯一的排程理由。
+
+**兩處刻意優於 Java（藍圖 §5 新增 10a / 10b）**
+
+- **`FOR UPDATE SKIP LOCKED`**：Java 的 poller 沒有鎖，它的 javadoc 自己寫著
+  多副本會重複投遞、並建議改用 SKIP LOCKED。Go 版直接做掉：第二個副本
+  **不等鎖**也**不拿同一批**，而是去撈下一批。
+- **分塊刪除**：Java 是一句無界的 bulk DELETE。壓測跑滿一週後保留期外可能是
+  數百萬列，一次刪光會在帳務主庫上開一筆超大交易。
+
+**規則不變的部分（照抄，不是改良）**
+
+- **只刪 SENT**，PENDING 無論多舊都不刪（地雷 #5）——刪掉就是無聲丟失事件。
+  `TestPurgeSentOutboxOnlyDeletesSent` 把「保留期外的 PENDING 必須活著」寫成斷言。
+- 投遞失敗維持 PENDING 並累加 `retry_count`；`retry_count` 沒有任何控制作用
+  （沒有上限、不轉 DLT），純粹是觀測用的，對齊 Java。
+- 部分成功是**正常情況**：一批事件打散到多個 partition，成功的標 SENT、
+  失敗的重試，而**交易照樣提交**——回滾的話「已經送進 Kafka」這個事實就沒被記錄。
+
+**如何驗證**
+
+```
+go test -race ./...                    # 全綠
+go test -race -tags=infra ./...        # 全綠（含 MySQL 與真實 Kafka 的往返）
+golangci-lint run                      # 0 issues
+```
+
+手動端到端（2026-08-02，MySQL 8.4 + Kafka 4.1）：下注 → outbox 列由 PENDING
+變 SENT → `kafka-console-consumer` 讀到 payload **逐位元組**等於 outbox 那一列、
+key 是 playerId、topic 有 6 個 partition。事件延遲 **208–372ms**（poll interval
+200ms 決定）。⚠️ 第一則是 484ms 且 `retry_count=1`：topic 的自動建立是非同步的，
+第一次 produce 必定撞一次 `Unknown Topic Or Partition`，下一輪成功——
+**那行 ERROR 是預期的**，每個 topic 一輩子一次。
+
+**尚未做（下一輪）**
+
+- `member.registered` consumer 與 `createWallet`（契約測試要能建錢包，
+  而 Java 版只有這條路徑）。⚠️ 會一次踩到地雷 #19/#20/#22/#25。
+- outbox 積壓的 gauge（Java 有 `WalletOutboxMetrics`）。等 Phase H 的 OTel 一起做，
+  現在沒有任何指標管線可以接。⚠️ 做的時候要用 `atomic` + 背景刷新，
+  不可以讓回呼直接查 DB（地雷 #23）。
+
+---
+
 ## [feat] — 2026-08-02 — wallet HTTP 層與 `cmd/wallet`：第一個跑得起來的服務
 
 Phase A 的第四個切片。到這一輪為止 wallet 一直是「一包函式」，

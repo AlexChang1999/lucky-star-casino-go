@@ -11,16 +11,19 @@
 
 ## 目前狀態
 
-🚧 **骨架階段**。基礎設施與治理層已就緒，業務服務尚未開工。
+🚧 **Phase A 施工中**。`wallet` 的帳務核心與事件投遞已可跑，
+契約測試與讀端投影尚未開工。
 
 | 項目 | 狀態 |
 |---|---|
 | 基礎設施（MySQL / MongoDB / Redis / Kafka） | ✅ compose 一鍵起，煙霧測試全綠 |
-| 連線層 `internal/platform`（設定驗證、連線池） | ✅ 含表格驅動測試 |
+| 連線層 `internal/platform`（設定驗證、連線池、migration） | ✅ 含表格驅動測試 |
 | 治理層（`AGENTS.md` / `CLAUDE.md` / subagent） | ✅ |
-| ADR-000 為什麼現在改用 Go | ✅ |
-| ADR-001 資料層：MySQL + MongoDB | ✅ |
-| Phase A `wallet` 重構 | ⬜ 下一步 |
+| ADR-000 / 001 / 002 / 003 | ✅ |
+| `wallet` 帳務：debit / credit（冪等鍵、樂觀鎖、補償回沖） | ✅ 含 `-race` 併發測試 |
+| `wallet` HTTP 與 `cmd/wallet` | ✅ 逐字對齊 Java 的端點契約 |
+| `wallet` Transactional Outbox → Kafka（poller + 清理排程） | ✅ 端到端實測 208–372ms |
+| `member.registered` consumer、契約測試、讀端投影 | ⬜ 下一步 |
 
 **已完成的前導專案**：`notification-service` →
 [**lucky-star-notify-go**](https://github.com/AlexChang1999/Lucky_Star_Notify_Go)

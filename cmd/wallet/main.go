@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/migrate"
 	platformstore "github.com/AlexChang1999/lucky-star-casino-go/internal/platform/store"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/httpapi"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/outbox"
 	walletstore "github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
 )
 
@@ -48,8 +50,9 @@ func run() error {
 	// ⚠️ 兩個 loader 各自回錯、最後 Join：缺 MYSQL_PASSWORD 與缺
 	// INTERNAL_SECRET 要能**一次看完**，而不是修一個、重跑、再看到下一個。
 	mysqlCfg, mysqlErr := config.LoadMySQL()
+	kafkaCfg, kafkaErr := config.LoadKafka()
 	walletCfg, walletErr := config.LoadWallet()
-	if err := errors.Join(mysqlErr, walletErr); err != nil {
+	if err := errors.Join(mysqlErr, kafkaErr, walletErr); err != nil {
 		return fmt.Errorf("載入設定失敗（是不是忘了 set -a; . deploy/.env; set +a）: %w", err)
 	}
 
@@ -61,6 +64,7 @@ func run() error {
 	logger.Info("wallet 啟動中",
 		"port", walletCfg.HTTP.Port,
 		"mysql", fmt.Sprintf("%s:%d/%s", mysqlCfg.Host, mysqlCfg.Port, mysqlCfg.Database),
+		"kafka", kafkaCfg.Brokers,
 		"sqlLog", walletCfg.SQLLog,
 		"logLevel", walletCfg.LogLevel.String(),
 	)
@@ -119,6 +123,39 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// ── Transactional Outbox 的投遞側（AGENTS.md 地雷 #5）───────────────
+	// ⚠️ 這裡**刻意不做 Kafka 的開機自檢**，與上面兩項 schema 自檢相反。
+	// 理由是兩者的失敗後果不同：schema 錯了會算錯帳，所以寧可開不起來；
+	// Kafka 掛了則只是事件送不出去——而帳務照樣可以正確地寫進 MySQL 與 outbox，
+	// 等 Kafka 回來再補送。**為了下游而讓帳務服務開不起來，是把可用性倒過來換。**
+	// （kafka-go 的 writer 本來就是延遲連線的，這裡不連也不會有事。）
+	publisher := outbox.NewPublisher(
+		outbox.NewWriter(kafkaCfg.Brokers, walletCfg.Outbox.BatchSize, logger), logger)
+	poller := outbox.NewPoller(repo, publisher.Publish, walletCfg.Outbox, logger)
+	purger := outbox.NewPurger(repo, walletCfg.Outbox.Retention, logger)
+
+	// ⚠️ 收工順序是**由外往內**，而且不能靠 defer 的 LIFO 去湊：
+	//   ① serve 返回（ctx 已取消）→ ② 等兩個背景 goroutine 跑完當前這一輪
+	//   → ③ 關 Kafka writer → ④ 關 MySQL（上面那個 defer，LIFO 排在最後）
+	// 順序反了的症狀都很難查：先關 writer，最後一輪會把已寫入 DB 的事件
+	// 誤判成投遞失敗；先關 DB，poller 會在標記 SENT 那一步炸掉。
+	var background sync.WaitGroup
+	background.Add(2)
+	go func() {
+		defer background.Done()
+		poller.Run(ctx)
+	}()
+	go func() {
+		defer background.Done()
+		purger.Run(ctx)
+	}()
+	defer func() {
+		background.Wait()
+		if err := publisher.Close(); err != nil {
+			logger.Error("關閉 Kafka writer 失敗", "err", err)
+		}
+	}()
 
 	return serve(ctx, logger, walletCfg.HTTP, handler)
 }
