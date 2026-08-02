@@ -157,16 +157,15 @@ Invalid request: subType subType must be one of BET/SHOP_PURCHASE
 
 ---
 
-## 加進 CI
+## CI
 
-`chore/ci-and-image` 那條分支合併之後，在 `.github/workflows/ci.yml` 的
-`infra` job 後面接一段即可（Go 目標可以完全在 CI 裡跑；Java 目標需要團隊 repo，
-留在本機）：
+**go 目標已經在 CI 裡跑**（`.github/workflows/ci.yml` 的 `infra` job 最後一步）。
+掛在那個 job 裡而不是另開一個：契約測試要的 MySQL + Kafka + 已跑完的 migration
+在那裡全都有了，另開一個 job 等於再起一次全部容器換來一個更好看的名字。
 
-```yaml
-      - name: 契約測試（Go 目標）
-        run: |
-          set -a && . deploy/.env && set +a
-          go run ./cmd/wallet &
-          CONTRACT_TARGET=go go test -tags=contract -count=1 ./test/contract/
-```
+⚠️ **java 目標不在 CI 裡**，因為它需要團隊 repo 的 wallet-service 與 PostgreSQL。
+所以：
+
+> **CI 綠只證明 Go 版沒有回歸，不證明兩版仍然等價。**
+> 「兩版等價」目前是**手動、按需**驗證的——每次改動 HTTP 契約、
+> 或準備把某個切片當成「完成」時，都要在本機對 java 目標跑一次。

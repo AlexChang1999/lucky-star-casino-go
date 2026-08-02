@@ -1,0 +1,74 @@
+# golangci-lint 設定（v2 schema，`version: "2"` 是必填的第一行）。
+#
+# ⚠️ **最重要的一行是 `run.build-tags`**。在這行之前，`golangci-lint run` 看不到
+# 任何 `//go:build infra` 的檔案——而那些檔案是本專案帳務正確性的全部證據
+# （debit/credit 的隔離級別、gap lock、1062 補償、outbox 的鎖範圍與 filesort）。
+# 沒有這行，「lint 全綠」這句話涵蓋不到最該被涵蓋的七個檔。
+#
+# ⚠️ build tag 也不是「加了就會被檢查」那麼理所當然：沒有 tag 的時候那些檔案
+# **根本不在套件的檔案集合裡**，所以既不會報錯也不會有任何提示——
+# 又是一個沒有錯誤訊息的漏洞。
+version: "2"
+
+run:
+  build-tags:
+    - infra
+  # 帳務的 infra 測試要等 MySQL 起容器、跑 migration，預設 1 分鐘不夠。
+  timeout: 5m
+
+linters:
+  # standard = errcheck / govet / ineffassign / staticcheck / unused。
+  # ⚠️ 不用 `all`：那會把一堆風格取向的 linter 一起打開（例如強制註解格式、
+  # 禁用 init()），本專案的取捨是「找 bug 的留下、講品味的不要」——
+  # 品味的部分由 CLAUDE.md 與 review 負責，不該由工具吵架。
+  default: standard
+  enable:
+    # ⭐ errorlint：抓 `err == ErrX` 與 `err.(*MyErr)` 這種不穿透 `%w` 的比較。
+    # 本專案到處在包裝錯誤（store → service → httpapi），漏一個 errors.Is
+    # 的症狀是「1062 沒被辨識成冪等命中」——帳務直接錯，而且沒有錯誤訊息。
+    - errorlint
+    # ⭐ rowserrcheck / sqlclosecheck：`rows.Err()` 沒檢查會讓「查到一半連線斷掉」
+    # 看起來像「查完了，結果是空的」。帳務對帳查詢吃到這個就是無聲少一筆。
+    - rowserrcheck
+    - sqlclosecheck
+    # noctx：不帶 context 的 HTTP/DB 呼叫＝不可取消、不吃逾時。本專案每一條
+    # 路徑都有明確的逾時預算（startupTimeout / roundTimeout / purgeTimeout），
+    # 漏傳 ctx 會讓那個預算悄悄失效。
+    - noctx
+    # bodyclose：契約測試與未來的 gateway 會大量開 HTTP client，
+    # 沒關 body 的連線不會回到連線池，症狀是壓測到一半 fd 用盡。
+    - bodyclose
+    - misspell
+
+  settings:
+    errcheck:
+      # 型別斷言要帶 ok。`x.(*T)` 失敗是 panic，在背景 goroutine 裡就是整個
+      # 服務掛掉，而錯誤訊息指向 runtime 而不是那句斷言。
+      check-type-assertions: true
+      # ⚠️ check-blank 維持 false（預設）：`_ = f()` 是 Go 用來**明說**
+      # 「這個錯誤我刻意不理」的唯一寫法。把它也判成錯，等於逼所有人改回
+      # 裸呼叫 `f()`——那才是真的看不出意圖。
+      check-blank: false
+
+  exclusions:
+    # ⚠️ 測試檔**不豁免** errcheck：帳務測試裡一個沒檢查的 error 就是
+    # 「測試綠但其實那句 SQL 根本沒跑成功」。這是本專案最不能豁免的地方。
+    # 這裡只留 golangci 內建的通用規則（generated code 等）。
+    generated: lax
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # noctx 只在正式程式碼有意義：它防的是「這條網路呼叫沒有逾時預算」，
+      # 而本專案每條路徑的預算都是明寫的（startupTimeout / roundTimeout /
+      # purgeTimeout）。測試裡的 net.Listen(":0")、httptest.NewRequest 換成
+      # 帶 ctx 的版本不會讓任何東西更安全，只會讓測試變吵。
+      - path: _test\.go
+        linters:
+          - noctx
+
+formatters:
+  # gofmt 不是風格意見（CLAUDE.md §3）——它由工具決定，所以放進 CI 而不是 review。
+  enable:
+    - gofmt
+    - goimports

@@ -89,8 +89,190 @@ CONTRACT_TARGET=java go test -tags=contract -count=1 ./test/contract/   # ok 4.0
 - 409 樂觀鎖衝突（黑箱難以穩定重現，由 store 層的
   `TestCreditConcurrentSamePlayer` 釘住）。
 - 玩家端點 `/api/v1/wallet/**`（Go 版還沒實作）。
-- ⚠️ 契約測試**尚未進 CI**：`chore/ci-and-image` 那條分支合併後才接得上去，
-  job 片段已經寫在 `test/contract/README.md`，避免兩條分支同時改 `ci.yml`。
+- ⚠️ **CI 只跑 go 目標**：契約測試已接進 CI 的 `infra` job（重用同一組容器），
+  但 java 目標需要團隊 repo 的 wallet-service 與 PostgreSQL，只能在本機跑。
+  也就是說 **CI 綠只證明 Go 版沒有回歸，不證明兩版仍然等價**——
+  「兩版等價」這件事到目前為止是**手動、按需**驗證的。
+
+---
+
+## [fix] — 2026-08-02 — outbox poller 的退避與積壓可見性，並修正 Kafka partition 的記錄
+
+上一輪（outbox poller）留下兩個「照抄 Java 所以不算退步、但確實是問題」的地方，
+這一輪把它們補上，並修掉一條**寫錯的事實**。
+
+**⭐ 第一條：Kafka 斷線時，poller 會對帳務主庫做無退避的寫入放大**
+
+投遞整批失敗最常見的原因是 Kafka 整個不通。在這之前，每一輪照樣做
+「一次 `SELECT ... FOR UPDATE` + 一次最多 500 列的 `UPDATE retry_count + 1`」，
+200ms 一輪打在**帳務主庫**上直到 Kafka 回來——斷線半小時就是 **9,000 輪**。
+
+⚠️ 這與地雷 #37 是同一類（背景排程在帳務主庫上加壓），只是原因從鎖換成重試；
+症狀一樣沒有錯誤訊息可以指認：帳務交易只是「偶爾變慢」，而 poller 的日誌
+看起來完全合理——它確實每一輪都失敗了。
+
+Java 的 `WalletOutboxPoller` 是同一個形狀（`fixedDelay` 200ms、batch 500、
+失敗累加 `retry_count`、無退避），所以這**不是** Go 版的退步；
+但它是一個實際存在的問題，因此照 CLAUDE.md §5 的規矩：
+**不無聲改掉，而是寫進藍圖 §5 當成刻意的改進**（新增 10c）。
+
+- 連續整輪失敗時指數退避：200ms → 400 → 800 → 1.6s → 3.2s → **5s 封頂**
+- **任何一則送出去就立刻回到 200ms**，不是慢慢遞減——這裡量的不是負載，
+  是「Kafka 通不通」，它通了就是通了
+- ⚠️ **部分失敗不退避**：一批打散到多個 partition，其中一個 leader 換屆只會讓
+  那幾則失敗，Kafka 是活的，退避只會拖慢其餘正常的事件。判準寫在
+  `classifyRound`：**這一輪有沒有任何一則真的送出去**
+- ⚠️ 代價：Kafka 復原後第一則事件最多晚 5 秒（Java 永遠是 200ms）。
+  上限之所以只有 5 秒，就是為了把這個對外可觀測的差異壓在
+  「一次下注的等待都不到」的量級
+
+**⭐ 第二條：outbox 積壓在 INFO 層級是完全隱形的**
+
+poller 沒事做時**刻意什麼都不印**（200ms 一輪，印一行就是每天 43 萬行雜訊），
+成功時走 Debug。於是「積了 50 萬列」與「一切正常」在 INFO 上長得一模一樣。
+
+現在**撈滿一整批**時記一行 WARN——撈滿＝這一輪之後還有得撈＝投遞追不上寫入。
+⚠️ 這是**過渡方案**：真正的解法是 Phase H 的積壓 gauge（Java 有
+`WalletOutboxMetrics`），但那要有指標管線。在那之前這一行是零成本的替代品。
+（藍圖 §5 新增 10d。）
+
+**⭐ 第三條：藍圖 §1.2 對 Java 的 Kafka topic 記錄是錯的**
+
+原本寫「8 個業務 topic（partitions 3）+ 5 個 DLT（partitions 1）」。
+逐行讀過 `kafka/kafka-init.sh` 之後，實際是**三層**：
+
+| 層 | topic | partitions |
+|---|---|---|
+| 高流量 | `wallet.debit` / `wallet.credit` / `wallet.credit.request` / `game.result` / `notification.push` | **6** |
+| 低流量 | `member.registered` / `friend.relationship.updated` / `rank.update` | **3** |
+| DLT | 5 個 | **1** |
+
+⚠️ 這件事會影響下一個切片：`member.registered` 與它的 DLT 正好都在
+「本專案與 Java 不同」的那兩層。
+
+**本專案的決定：一律 6，不複製那套分層**（`KAFKA_NUM_PARTITIONS` 是全域值，
+本來也蓋不出三層）。理由與代價寫在 compose 的註解裡，重點是：
+
+- 兩邊是**完全錯開的獨立叢集**（9092 / 9095），partition 數不同不會造成跨版問題
+- 要複製分層就得養一支建 topic 的腳本，而那支腳本會漂移——
+  「topic 少建一個」的症狀是 consumer 靜靜地收不到訊息（地雷 #19）
+- ⚠️ 代價：**真的要走「兩版寫同一個 topic」的切換路徑時，那些 topic 必須先對齊
+  partition 數**，否則同一個 playerId 會落到不同 partition（`murmur2 % N`）
+
+**Changed：Murmur2Balancer 的理由改寫（地雷 #38）**
+
+原本寫的是「重構期間兩版並存 → 同 playerId 落到不同 partition」。
+那個情境**不成立**：兩版的設定完全錯開，是兩個獨立叢集，平常撞不到。
+正確的理由是**切換當下那個窗口**（灰度、雙寫、切過去又回退）——
+那時兩版會有一段時間對同一個 topic 產訊息。
+
+⚠️ 選擇本身**不變**（Murmur2 仍然是對的），變的是為什麼。
+留著一個站不住腳的理由比沒有理由更糟：下一個人會照著那個理由去做別的決定。
+
+**如何驗證**
+
+```
+go test -race -count=1 ./...                      # 全綠
+go test -race -count=1 -tags=infra ./internal/... # 全綠（wallet/store 32.8s）
+```
+
+兩個新測試都確認過**拿掉實作就會紅**（不會紅的測試等於沒測）：
+
+- `TestPollerBacksOffWhenNothingIsDelivered`——把 `nextDelay` 改成永遠回設定值，
+  400ms 內從 8 輪變成 **67 輪**，測試紅在「看起來沒有退避」
+- `TestNextDelay` / `TestClassifyRound`——表格驅動，逐格釘住
+  「部分失敗不退避」與「撈取失敗要退避」這兩個相反的判斷
+
+---
+
+## [chore] — 2026-08-02 — CI/CD 與映像：把「記得跑」換成「跑不掉」
+
+到這一輪為止，本專案的驗證全靠人記得在提交前跑四行指令、記得先把 compose 起來、
+記得加 `-tags=infra`。**忘記其中任何一項都不會有人發現**——而最容易忘的那一項
+正好蓋著帳務。
+
+**Added**
+
+- **`.github/workflows/ci.yml`**——四個 job：`lint` / `unit`（build + vet ×2 +
+  `test -race`）/ **`infra`**（起真的 MySQL 與 Kafka 跑 `-tags=infra`）/ `image`。
+- **`.golangci.yml`**——本專案第一份 lint 設定（在這之前是跑預設值）。
+- **`Dockerfile` 與 `.dockerignore`**——七個服務**共用一份**，
+  `--build-arg SERVICE=<name>` 選一個。
+
+**⭐ 最重要的一條：沒有 `infra` build tag 的地方，帳務等於沒被測到**
+
+`internal/wallet/store` 的測試全部帶 `//go:build infra`。不加那個 tag 時，
+`go test ./...` 對那個套件印的是 **`[no test files]`**：
+
+| | 涵蓋 `internal/wallet/store` 嗎 |
+|---|---|
+| `go test -race ./...` | ❌ `[no test files]` |
+| `go test -race -tags=infra ./...` | ✅ debit/credit 三條 SQL、三個隔離級別、gap lock 死鎖、1062 補償回沖 |
+| `golangci-lint run`（**改這版之前**） | ❌ 那七個檔案不在套件的檔案集合裡 |
+
+⚠️ 兩者的共同點又是「**沒有錯誤訊息**」：沒被 lint 的檔案不會有任何提示，
+沒被執行的測試在輸出裡長得跟「這個套件沒有測試」一模一樣。
+所以 CI 的 `infra` job 不是加分項，它是**唯一**會執行帳務 SQL 的地方；
+而 `.golangci.yml` 的 `run.build-tags: [infra]` 是這份設定裡最重要的一行。
+
+**lint 設定的三個決定（都不是預設值）**
+
+- **開 `errorlint` / `rowserrcheck` / `sqlclosecheck` / `noctx` / `bodyclose`**：
+  全部是「會產生無聲錯誤」那一類。`errorlint` 尤其重要——本專案從 store 到
+  httpapi 一路用 `%w` 包裝，漏一個 `errors.Is` 的症狀是**1062 沒被辨識成冪等命中**。
+- **`errcheck.check-type-assertions: true`，但 `check-blank` 維持 false**：
+  `x.(*T)` 失敗是 panic，在背景 goroutine 裡就是整個服務掛掉；
+  而 `_ = f()` 是 Go **明說**「這個錯誤我刻意不理」的唯一寫法，把它也判成錯
+  只會逼大家改回裸呼叫，那才真的看不出意圖。
+- **`noctx` 在 `_test.go` 豁免**：它防的是「這條網路呼叫沒有逾時預算」，
+  而正式路徑的預算都是明寫的。測試裡把 `httptest.NewRequest` 換成帶 ctx 的版本
+  不會讓任何東西更安全。
+
+唯一因此改動的正式程式碼：`cmd/wallet/main_test.go` 的
+`ln.Addr().(*net.TCPAddr)` 補上 ok 檢查。
+
+**Dockerfile 的取捨**
+
+- **scratch + `CGO_ENABLED=0`**。後者是前者的**前提**不是效能選項：動態連結的
+  binary 塞進 scratch 會啟動即死，而訊息（`no such file or directory`）指的是
+  找不到**動態連結器**——Go 容器化最容易被誤讀的錯誤訊息。
+- **代價寫進註解**：不能 `docker exec`（沒 shell）、不能寫 `HEALTHCHECK`
+  （沒 curl，改由外面打 `/healthz`）、**沒有 tzdata**（本專案一律 UTC，地雷 #39；
+  哪天真要時區，正解是 `import _ "time/tzdata"` 編進 binary，不是往映像塞檔案）。
+- **`GOMEMLIMIT` 刻意不寫進映像**：它必須與容器記憶體上限成對且略低（地雷 #24），
+  而上限是部署時才知道的事。寫死在映像裡，換一個記憶體規格就變成
+  「軟上限比硬上限高」＝等於沒設。
+- **基底釘到 patch（`golang:1.26.5-alpine`）**：浮動的 `1.26` 有天會滾版，
+  於是同一個 commit 建出不同的 binary，而 CI 是綠的。
+- **`.git` 不進建置上下文**，所以 binary 裡沒有 vcs.revision；
+  「這顆映像是哪個 commit」改由 image label（`VCS_REF`，CI 帶 `github.sha`）回答。
+
+**CD 的邊界**
+
+`image` job 在 PR 上**只建不推**（驗證 Dockerfile 沒壞），進 develop/main 才推 GHCR。
+matrix 包含 `migrate`：schema 不在服務啟動時自動跑（`docs/ADR-003`），
+K8s 那邊是獨立的 Job / initContainer，**那個 Job 需要一顆映像**。
+⚠️ 沒有「部署」這一段，因為目前沒有部署目標——那是 Phase H（K8s）的事。
+
+**如何驗證**
+
+CI 的每一步都在本機逐字跑過（2026-08-02，Windows 11 + Docker Desktop）：
+
+```
+golangci-lint run                          # 0 issues（含 infra tag 的七個檔）
+go vet ./... && go vet -tags=infra ./...   # 通過
+go test -race ./...                        # 全綠
+go test -race -count=1 -tags=infra ./...   # 全綠（wallet/store 32.98s）
+docker build --build-arg SERVICE=wallet    # 成功，映像 36.3 MB
+docker run --rm casino-go/wallet:dev       # 缺設定時明確失敗（scratch + nonroot 可執行）
+```
+
+⚠️ **workflow 本身尚未在 GitHub Actions 上跑過**——那要等這條分支推上去。
+本機驗證的是「每一步指令都會過」，不是「YAML 沒有語法錯」。
+
+⚠️ 映像 **36.3 MB** 與 notify-go 的 18.6 MB 不是同一個量級的比較：
+wallet 帶著 GORM + MySQL driver + kafka-go + Mongo driver + Redis + Gin，
+notify-go 只有標準庫。**兩個數字都要標明依賴組成才可引用**（`AGENTS.md` §2.7）。
 
 ---
 

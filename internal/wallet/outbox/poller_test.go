@@ -1,8 +1,11 @@
 package outbox
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -126,6 +129,144 @@ func TestPollerKeepsRunningAfterFailure(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// TestClassifyRound 釘住退避的**判準**：這一輪有沒有任何一則真的送出去。
+//
+// ⚠️ 最容易寫錯的是第三與第四格：帶著 error 但有送出去的那一輪，Kafka 是活的
+// （只是某個 partition 的 leader 換屆），退避會拖慢其餘正常的事件；
+// 而「撈到卻一則都沒送成」即使沒有 error 也是停滯——那代表 PublishFunc 壞了。
+func TestClassifyRound(t *testing.T) {
+	boom := errors.New("kafka 掛了")
+
+	tests := []struct {
+		name  string
+		stats store.PublishStats
+		err   error
+		want  roundOutcome
+	}{
+		{"沒事做", store.PublishStats{}, nil, outcomeIdle},
+		{"撈取本身失敗（DB 不通）", store.PublishStats{}, boom, outcomeStalled},
+		{"整批送出成功", store.PublishStats{Fetched: 3, Sent: 3}, nil, outcomeProgress},
+		{"部分失敗但有送出去", store.PublishStats{Fetched: 3, Sent: 2, Failed: 1}, boom, outcomeProgress},
+		{"撈到了但一則都沒送成", store.PublishStats{Fetched: 3, Failed: 3}, boom, outcomeStalled},
+		{"一則都沒送成且沒有 error", store.PublishStats{Fetched: 3, Failed: 3}, nil, outcomeStalled},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyRound(tt.stats, tt.err); got != tt.want {
+				t.Errorf("classifyRound() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNextDelay 釘住退避的四條規則。
+//
+// ⚠️ 最後兩格是「設定的間隔大於退避上限」的情況（WALLET_OUTBOX_POLL_INTERVAL
+// 是可調的）。夾錯方向的話，故障時輪詢反而變得**比設定值更密**——
+// 一個為了減壓而寫的機制，結果在最需要減壓的時候加壓。
+func TestNextDelay(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval time.Duration
+		current  time.Duration
+		outcome  roundOutcome
+		want     time.Duration
+	}{
+		{"沒事做 → 回到設定間隔", 200 * time.Millisecond, 3 * time.Second, outcomeIdle, 200 * time.Millisecond},
+		{"有進度 → 立刻回到設定間隔", 200 * time.Millisecond, 3 * time.Second, outcomeProgress, 200 * time.Millisecond},
+		{"停滯 → 加倍", 200 * time.Millisecond, 200 * time.Millisecond, outcomeStalled, 400 * time.Millisecond},
+		{"停滯 → 封頂在 maxPollBackoff", 200 * time.Millisecond, 4 * time.Second, outcomeStalled, maxPollBackoff},
+		{"停滯且已封頂 → 不再增加", 200 * time.Millisecond, maxPollBackoff, outcomeStalled, maxPollBackoff},
+		{"設定間隔已大於上限 → 停滯時不加倍也不縮短", 30 * time.Second, 30 * time.Second, outcomeStalled, 30 * time.Second},
+		{"設定間隔大於上限 → 有進度時回到設定值", 30 * time.Second, 60 * time.Second, outcomeProgress, 30 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewPoller(fakeStore{}, noopPublish,
+				config.Outbox{PollInterval: tt.interval, BatchSize: 1, Retention: time.Hour}, discardLogger())
+			if got := p.nextDelay(tt.current, tt.outcome); got != tt.want {
+				t.Errorf("nextDelay(%v, %v) = %v, want %v", tt.current, tt.outcome, got, tt.want)
+			}
+		})
+	}
+}
+
+// ⭐ TestPollerBacksOffWhenNothingIsDelivered 是「背景排程不可以壓垮帳務主庫」的回歸測試。
+//
+// 沒有退避的話，Kafka 斷線期間每一輪都是
+// 「一次 SELECT ... FOR UPDATE + 一次最多 batchSize 列的 UPDATE」，
+// 200ms 一輪打在**帳務主庫**上，一直打到 Kafka 回來——斷線半小時就是 9,000 輪。
+// ⚠️ 而症狀只是「下注偶爾變慢」，日誌看起來完全合理（它確實每輪都失敗了）。
+//
+// 這個測試用 5ms 的間隔跑 400ms：沒有退避會是數十輪，有退避是個位數。
+// 門檻刻意放寬到 15，量的是「有沒有退避」而不是「退避得多精準」——
+// 精準的部分由 TestNextDelay 逐格釘死，這裡只證明它真的接上了迴圈。
+func TestPollerBacksOffWhenNothingIsDelivered(t *testing.T) {
+	var calls atomic.Int64
+	s := fakeStore{publishPending: func(context.Context, int, store.PublishFunc) (store.PublishStats, error) {
+		calls.Add(1)
+		return store.PublishStats{Fetched: 1, Failed: 1}, errors.New("kafka 掛了")
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := config.Outbox{PollInterval: 5 * time.Millisecond, BatchSize: 7, Retention: time.Hour}
+	done := make(chan struct{})
+	go func() {
+		NewPoller(s, noopPublish, cfg, discardLogger()).Run(ctx)
+		close(done)
+	}()
+
+	time.Sleep(400 * time.Millisecond)
+	cancel()
+	<-done
+
+	got := calls.Load()
+	if got > 15 {
+		t.Errorf("400ms 內跑了 %d 輪，看起來沒有退避（5ms 間隔不退避約是 80 輪）——"+
+			"Kafka 斷線期間這些輪次全部是打在帳務主庫上的寫入", got)
+	}
+	if got == 0 {
+		t.Error("一輪都沒跑，這個測試沒有量到任何東西")
+	}
+}
+
+// TestPollerWarnsWhenBatchIsFull 釘住唯一一個「outbox 積壓」的訊號。
+//
+// ⚠️ 為什麼需要它：poller 沒事做時**刻意什麼都不印**（200ms 一輪，印一行就是
+// 每天 43 萬行雜訊），成功時走 Debug。於是在 INFO 層級上，「積了 50 萬列」
+// 與「一切正常」長得一模一樣。撈滿一整批＝這一輪之後還有得撈＝投遞追不上寫入。
+func TestPollerWarnsWhenBatchIsFull(t *testing.T) {
+	tests := []struct {
+		name     string
+		fetched  int
+		wantWarn bool
+	}{
+		{"撈滿整批 → 警示", 7, true},
+		{"沒撈滿 → 不警示（正常運轉不該吵）", 6, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := &bytes.Buffer{}
+			s := fakeStore{publishPending: func(context.Context, int, store.PublishFunc) (store.PublishStats, error) {
+				return store.PublishStats{Fetched: tt.fetched, Sent: tt.fetched}, nil
+			}}
+
+			p := NewPoller(s, noopPublish, testOutboxConfig(),
+				slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			p.runOnce(context.Background())
+
+			if gotWarn := strings.Contains(logs.String(), "level=WARN"); gotWarn != tt.wantWarn {
+				t.Errorf("有 WARN = %v, want %v；日誌內容:\n%s", gotWarn, tt.wantWarn, logs.String())
+			}
+		})
+	}
 }
 
 // TestPollerPassesBatchSizeAndPublish 釘住設定值真的有走到 store。

@@ -415,10 +415,17 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
       **事件無聲蒸發，而資料庫說已送出**，正是 Outbox 唯一要防的那件事。
     - **`Balancer` 預設是 `&Hash{}`（FNV-1a），與 Java 不相容**。Java 的
       DefaultPartitioner 是 `murmur2(key) % partitions`，kafka-go 對應的是
-      `&Murmur2Balancer{}`。用錯的話同一個 `playerId` 在 Java 版與 Go 版落到
-      **不同 partition**，而重構期間兩版是並存的——同玩家事件橫跨兩個 partition
-      ＝Kafka 唯一的順序保證失效，下游看到的「先扣款後派彩」變成隨機順序。
-      Kafka、producer、consumer 三邊都不會報錯。
+      `&Murmur2Balancer{}`。用錯的話同一個 `playerId` 在兩版落到**不同 partition**。
+      ⚠️ **這條的情境在 2026-08-02 修正過**：開發期間兩版的設定是**完全錯開**的
+      （Java 的 Kafka 在 9092、本專案在 9095，兩個獨立叢集），所以平常撞不到。
+      真正要防的是**切換當下**——灰度、雙寫、或切過去又回退時，兩版會有一段時間
+      對**同一個 topic** 產訊息，那時同玩家事件就橫跨兩個 partition，
+      而 partition 內有序是 Kafka **唯一**的順序保證，跨過去下游看到的
+      「先扣款後派彩」變成隨機順序。Kafka、producer、consumer 三邊都不會報錯。
+      ⚠️ 而且**光是 balancer 一致還不夠**：murmur2 之後要對 partition 數取模，
+      所以同叢集切換的前提還包括「兩邊 partition 數相同」。本專案一律 6，
+      Java 是 6/3/1 三層——低流量 topic 與 DLT **對不上**，要切換得先對齊
+      （決策與代價見 `deploy/docker-compose.infra.yml` 的 `KAFKA_NUM_PARTITIONS`）。
 
     ⚠️ 而 #21 的處方（`BatchSize: 1`）**只適用於低頻單則寫入**。poller 是成批
     寫入，設成 1 會讓每則訊息各自成一個 batch，而每個 partition 一次只送一個 batch
@@ -551,10 +558,33 @@ test/load/            Go 自寫壓測 client
 
 ```bash
 go vet ./...
+go vet -tags=infra ./...   # ⚠️ 不加這行，infra 測試檔的編譯錯誤要等到有人起容器才會發現
 go test -race ./...
-golangci-lint run
+golangci-lint run          # ⚠️ .golangci.yml 已把 infra 寫進 run.build-tags
 go build ./...
 ```
+
+⭐ **這四行 GitHub Actions 會逐字再跑一次**（`.github/workflows/ci.yml`），
+外加一個**起真的 MySQL 與 Kafka** 的 job 跑 `-tags=infra`。
+CI 用的是同一份 `deploy/docker-compose.infra.yml` 與同一份 `.env.example`——
+**不用 Actions 的 `services:` 另外寫一份**，那會變成第二個會漂移的真相，
+而漂移的方向必定是「CI 過了、本機不過」。
+
+⚠️ **為什麼 infra 那個 job 是必要的而不是加分**：不加 `-tags=infra` 時，
+`internal/wallet/store` 顯示的是 **`[no test files]`**——帳務的三條 SQL、
+三個隔離級別、gap lock 死鎖、1062 補償回沖**全部沒有被執行到**，而測試是綠的。
+
+**建映像**（七個服務共用一份 `Dockerfile`，`--build-arg` 選一個）：
+
+```bash
+docker build --build-arg SERVICE=wallet -t casino-go/wallet .
+```
+
+⚠️ 最終映像是 **scratch**，所以**不能 `docker exec` 進去**（沒有 shell）、
+**不能寫 HEALTHCHECK**（沒有 curl）。健康檢查由外面打 `GET /healthz`。
+`CGO_ENABLED=0` 是 scratch 的前提不是效能選項——動態連結的 binary 塞進 scratch
+會啟動即死，而錯誤訊息（`no such file or directory`）指的是找不到**動態連結器**，
+不是找不到執行檔。
 
 **跑起基礎設施**：
 
