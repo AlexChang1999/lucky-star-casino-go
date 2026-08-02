@@ -68,11 +68,24 @@ func NewWriter(brokers []string, batchSize int, logger *slog.Logger) *kafka.Writ
 
 		// ⭐ Balancer 必須是 Murmur2，不能用 kafka-go 的預設（&Hash{}，FNV-1a）。
 		//
-		// Java 的 DefaultPartitioner 用的是 murmur2(key) % partitions。
-		// 用 FNV-1a 的話，同一個 playerId 在 Java 版與 Go 版會落到**不同的 partition**——
-		// 而重構期間兩版會並存（藍圖 §4 是逐服務替換）。同一個玩家的事件橫跨兩個
-		// partition＝Kafka 唯一的順序保證失效，下游看到的「先扣款後派彩」變成隨機順序。
-		// ⚠️ 症狀是下游偶爾算錯，而 Kafka、producer、consumer 三邊都不會報錯。
+		// Java 的 DefaultPartitioner 用的是 murmur2(key) % partitions，
+		// kafka-go 的預設是 FNV-1a——同一個 playerId 會被算到**不同的 partition**。
+		//
+		// ⚠️ 這條的理由在 2026-08-02 修正過一次，因為原本寫的情境不成立：
+		// 開發期間兩版的**設定是完全錯開的**（Java 的 Kafka 在 9092、本專案在 9095，
+		// 兩個獨立叢集），所以「同一則事件被兩版寫進同一個 topic」平常不會發生。
+		// 真正要防的是**切換當下那個窗口**：灰度、雙寫、或切過去又回退時，
+		// 兩版會有一段時間對**同一個 topic** 產訊息。那時 balancer 不同就等於
+		// 同一個玩家的事件橫跨兩個 partition——而 partition 內有序是 Kafka
+		// **唯一**的順序保證，跨 partition 之後下游看到的「先扣款後派彩」是隨機順序。
+		// ⚠️ Kafka、producer、consumer 三邊都不會報錯，症狀只是下游偶爾算錯。
+		//
+		// ⚠️ 而且**光是 balancer 一致還不夠**：murmur2 之後要對 partition 數取模，
+		// 所以同叢集的前提還包括「兩邊看到的 partition 數相同」。
+		// 本專案的 topic 一律 6 個 partition（compose 的 KAFKA_NUM_PARTITIONS），
+		// 與 Java 的高流量 topic 相同，但 Java 的低流量 topic 是 3、DLT 是 1——
+		// **真的要走同叢集切換，那些 topic 要先對齊 partition 數**（見 compose 註解）。
+		// 選 Murmur2 的成本是零，而發現上面那件事的成本是「下游偶爾算錯」。
 		// （Consistent 保持 false：與 librdkafka 的 murmur2_random 一致，
 		// nil key 走隨機而不是全部擠進同一個 partition。wallet 的 key 一律是
 		// playerID，走不到那條路。）
