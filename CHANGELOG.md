@@ -5,6 +5,97 @@
 
 ---
 
+## [chore] — 2026-08-02 — CI/CD 與映像：把「記得跑」換成「跑不掉」
+
+到這一輪為止，本專案的驗證全靠人記得在提交前跑四行指令、記得先把 compose 起來、
+記得加 `-tags=infra`。**忘記其中任何一項都不會有人發現**——而最容易忘的那一項
+正好蓋著帳務。
+
+**Added**
+
+- **`.github/workflows/ci.yml`**——四個 job：`lint` / `unit`（build + vet ×2 +
+  `test -race`）/ **`infra`**（起真的 MySQL 與 Kafka 跑 `-tags=infra`）/ `image`。
+- **`.golangci.yml`**——本專案第一份 lint 設定（在這之前是跑預設值）。
+- **`Dockerfile` 與 `.dockerignore`**——七個服務**共用一份**，
+  `--build-arg SERVICE=<name>` 選一個。
+
+**⭐ 最重要的一條：沒有 `infra` build tag 的地方，帳務等於沒被測到**
+
+`internal/wallet/store` 的測試全部帶 `//go:build infra`。不加那個 tag 時，
+`go test ./...` 對那個套件印的是 **`[no test files]`**：
+
+| | 涵蓋 `internal/wallet/store` 嗎 |
+|---|---|
+| `go test -race ./...` | ❌ `[no test files]` |
+| `go test -race -tags=infra ./...` | ✅ debit/credit 三條 SQL、三個隔離級別、gap lock 死鎖、1062 補償回沖 |
+| `golangci-lint run`（**改這版之前**） | ❌ 那七個檔案不在套件的檔案集合裡 |
+
+⚠️ 兩者的共同點又是「**沒有錯誤訊息**」：沒被 lint 的檔案不會有任何提示，
+沒被執行的測試在輸出裡長得跟「這個套件沒有測試」一模一樣。
+所以 CI 的 `infra` job 不是加分項，它是**唯一**會執行帳務 SQL 的地方；
+而 `.golangci.yml` 的 `run.build-tags: [infra]` 是這份設定裡最重要的一行。
+
+**lint 設定的三個決定（都不是預設值）**
+
+- **開 `errorlint` / `rowserrcheck` / `sqlclosecheck` / `noctx` / `bodyclose`**：
+  全部是「會產生無聲錯誤」那一類。`errorlint` 尤其重要——本專案從 store 到
+  httpapi 一路用 `%w` 包裝，漏一個 `errors.Is` 的症狀是**1062 沒被辨識成冪等命中**。
+- **`errcheck.check-type-assertions: true`，但 `check-blank` 維持 false**：
+  `x.(*T)` 失敗是 panic，在背景 goroutine 裡就是整個服務掛掉；
+  而 `_ = f()` 是 Go **明說**「這個錯誤我刻意不理」的唯一寫法，把它也判成錯
+  只會逼大家改回裸呼叫，那才真的看不出意圖。
+- **`noctx` 在 `_test.go` 豁免**：它防的是「這條網路呼叫沒有逾時預算」，
+  而正式路徑的預算都是明寫的。測試裡把 `httptest.NewRequest` 換成帶 ctx 的版本
+  不會讓任何東西更安全。
+
+唯一因此改動的正式程式碼：`cmd/wallet/main_test.go` 的
+`ln.Addr().(*net.TCPAddr)` 補上 ok 檢查。
+
+**Dockerfile 的取捨**
+
+- **scratch + `CGO_ENABLED=0`**。後者是前者的**前提**不是效能選項：動態連結的
+  binary 塞進 scratch 會啟動即死，而訊息（`no such file or directory`）指的是
+  找不到**動態連結器**——Go 容器化最容易被誤讀的錯誤訊息。
+- **代價寫進註解**：不能 `docker exec`（沒 shell）、不能寫 `HEALTHCHECK`
+  （沒 curl，改由外面打 `/healthz`）、**沒有 tzdata**（本專案一律 UTC，地雷 #39；
+  哪天真要時區，正解是 `import _ "time/tzdata"` 編進 binary，不是往映像塞檔案）。
+- **`GOMEMLIMIT` 刻意不寫進映像**：它必須與容器記憶體上限成對且略低（地雷 #24），
+  而上限是部署時才知道的事。寫死在映像裡，換一個記憶體規格就變成
+  「軟上限比硬上限高」＝等於沒設。
+- **基底釘到 patch（`golang:1.26.5-alpine`）**：浮動的 `1.26` 有天會滾版，
+  於是同一個 commit 建出不同的 binary，而 CI 是綠的。
+- **`.git` 不進建置上下文**，所以 binary 裡沒有 vcs.revision；
+  「這顆映像是哪個 commit」改由 image label（`VCS_REF`，CI 帶 `github.sha`）回答。
+
+**CD 的邊界**
+
+`image` job 在 PR 上**只建不推**（驗證 Dockerfile 沒壞），進 develop/main 才推 GHCR。
+matrix 包含 `migrate`：schema 不在服務啟動時自動跑（`docs/ADR-003`），
+K8s 那邊是獨立的 Job / initContainer，**那個 Job 需要一顆映像**。
+⚠️ 沒有「部署」這一段，因為目前沒有部署目標——那是 Phase H（K8s）的事。
+
+**如何驗證**
+
+CI 的每一步都在本機逐字跑過（2026-08-02，Windows 11 + Docker Desktop）：
+
+```
+golangci-lint run                          # 0 issues（含 infra tag 的七個檔）
+go vet ./... && go vet -tags=infra ./...   # 通過
+go test -race ./...                        # 全綠
+go test -race -count=1 -tags=infra ./...   # 全綠（wallet/store 32.98s）
+docker build --build-arg SERVICE=wallet    # 成功，映像 36.3 MB
+docker run --rm casino-go/wallet:dev       # 缺設定時明確失敗（scratch + nonroot 可執行）
+```
+
+⚠️ **workflow 本身尚未在 GitHub Actions 上跑過**——那要等這條分支推上去。
+本機驗證的是「每一步指令都會過」，不是「YAML 沒有語法錯」。
+
+⚠️ 映像 **36.3 MB** 與 notify-go 的 18.6 MB 不是同一個量級的比較：
+wallet 帶著 GORM + MySQL driver + kafka-go + Mongo driver + Redis + Gin，
+notify-go 只有標準庫。**兩個數字都要標明依賴組成才可引用**（`AGENTS.md` §2.7）。
+
+---
+
 ## [feat] — 2026-08-02 — outbox poller 與清理排程：Transactional Outbox 的另一半
 
 Phase A 的第五個切片。在這之前 `wallet_outbox` 是**只進不出**的——

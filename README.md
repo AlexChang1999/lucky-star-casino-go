@@ -1,5 +1,7 @@
 # 幸運星幣城 — Go 全面重構
 
+[![CI](https://github.com/AlexChang1999/lucky-star-casino-go/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/AlexChang1999/lucky-star-casino-go/actions/workflows/ci.yml)
+
 把一個**正在跑的** Java 21 / Spring Boot 微服務平台（7 個服務、555 個 `.java`）
 逐服務重構為 Go，並用**黑箱契約測試**證明每一步都等價。
 
@@ -23,6 +25,7 @@
 | `wallet` 帳務：debit / credit（冪等鍵、樂觀鎖、補償回沖） | ✅ 含 `-race` 併發測試 |
 | `wallet` HTTP 與 `cmd/wallet` | ✅ 逐字對齊 Java 的端點契約 |
 | `wallet` Transactional Outbox → Kafka（poller + 清理排程） | ✅ 端到端實測 208–372ms |
+| CI/CD（lint / 單元 / **infra 測試真的起 MySQL+Kafka** / 建映像） | ✅ 映像實測 36.3 MB |
 | `member.registered` consumer、契約測試、讀端投影 | ⬜ 下一步 |
 
 **已完成的前導專案**：`notification-service` →
@@ -69,10 +72,22 @@ go run ./cmd/migrate status                  # 每個版本都該是 applied
 # 3. 測試
 go test -race ./...                          # 單元測試
 go test -race -tags=infra ./...              # 需要基礎設施真的起來
+golangci-lint run                            # ⚠️ 設定裡帶了 infra tag，見下
 
-# 4. 收工。⚠️ 不要隨手加 -v，Redis 是主儲存
+# 4. 映像（七個服務共用一份 Dockerfile，用 --build-arg 選）
+docker build --build-arg SERVICE=wallet -t casino-go/wallet .
+
+# 5. 收工。⚠️ 不要隨手加 -v，Redis 是主儲存
 docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env down
 ```
+
+> **⭐ 為什麼 `go test -race ./...` 全綠還不夠？**
+> `internal/wallet/store`（帳務的三條 SQL、隔離級別、gap lock、1062 補償）
+> 的測試全部帶 `//go:build infra`——不加那個 tag，那個套件顯示的是
+> **`[no test files]`**：最關鍵的一包程式碼覆蓋率是 0，而測試是綠的。
+> 所以 CI 有一個**專門的 job** 起真的 MySQL 與 Kafka 跑 `-tags=infra`，
+> 而 `.golangci.yml` 也把 `infra` 寫進 `run.build-tags`——
+> 少了那一行，lint 連那七個檔案都看不到。
 
 > **為什麼 schema 不是 `compose up` 就好？**
 > MySQL 官方映像的 `/docker-entrypoint-initdb.d` **只在 volume 全新時執行**，
