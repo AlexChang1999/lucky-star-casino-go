@@ -1,0 +1,221 @@
+# 基礎設施（只有基礎設施，沒有業務服務）。
+#
+#   docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env up -d --wait
+#
+# 為什麼基礎設施要獨立成一個檔：七個服務是**逐個**從 Java 換成 Go 的
+# （藍圖 §4 的重寫順序），在那段期間 Java 版與 Go 版會長期並存。
+# 把 DB/MQ 跟服務綁在同一個 compose 檔，每換一個服務就要動到基礎設施定義，
+# 而基礎設施是最不該被反覆重啟的東西（Redis 是主儲存，見下方註解）。
+#
+# ── 資料層定案（見 docs/ADR-001）────────────────────────────────
+#   MySQL    寫入主庫（帳務核心）      ← 取代團隊 repo 的 PostgreSQL
+#   MongoDB  CQRS 讀端 + 局紀錄        ← 取代團隊 repo 的 MySQL 讀庫
+#   Redis    分散式鎖 / ZSET / session ← 沿用，且是**主儲存**不是快取
+#   Kafka    事件匯流排                ← 沿用 8 topic + 5 DLT 的設計
+#
+# ── 對外埠一覽 ───────────────────────────────────────────────────
+# 三套環境要能同時跑（團隊 Java 版 / notify-go / 本專案），所以埠全部錯開。
+# 撞埠的症狀是 `Bind for 0.0.0.0:xxxx failed: port is already allocated`，
+# 訊息很清楚，但等你 compose 跑到一半才看到就已經浪費時間了。
+#
+#   服務        | 本專案 | 團隊 repo | lucky-star-notify-go
+#   ------------|--------|-----------|----------------------
+#   MySQL       |  3308  |   3307    |  —
+#   MongoDB     | 27018  |    —      |  —   ← 本專案新增
+#   Redis       |  6380  |   6379    |  —
+#   Kafka(HOST) |  9095  |   9092    |  9094
+#
+# ⚠️ MongoDB 用 27018 而不是預設的 27017：27017 留給「開發者自己在本機
+# 裝的 MongoDB」。作品集專案不該假設宿主是乾淨的。
+
+name: lucky-star-casino-go
+
+services:
+  # ── MySQL：帳務寫入主庫 ──────────────────────────────────────────
+  # ⚠️ 這是對團隊 ADR-001 的推翻（他們是 PG 寫 + MySQL 讀），理由見
+  # docs/ADR-001。帳務要的東西 InnoDB 都有：交易、SELECT ... FOR UPDATE、
+  # SKIP LOCKED、冪等鍵的 UNIQUE 衝突、樂觀鎖比對後的 RowsAffected。
+  #
+  # ⚠️ 金額欄位一律 DECIMAL 或整數最小單位，**嚴禁 float**。
+  # 這條與資料庫選型無關——IEEE 754 沒辦法精確表示 0.1，帳務對不起來時
+  # 你會查到懷疑人生，而且每一筆單看都「差不多對」。
+  mysql:
+    image: mysql:8.4
+    container_name: casino-go-mysql
+    restart: unless-stopped
+    # sql_mode 明寫而不是靠映像預設：STRICT_TRANS_TABLES 會讓超出欄位範圍的
+    # 寫入直接報錯而不是**靜默截斷**。帳務欄位被截斷卻沒有錯誤訊息，
+    # 是這類系統最惡劣的失敗模式之一。
+    command:
+      - "--sql-mode=STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION,ERROR_FOR_DIVISION_BY_ZERO"
+      - "--max-connections=300"
+      # 時區表沒載入時 CONVERT_TZ 會回 NULL 而不是報錯。本專案的結算與
+      # 每日快照都跟日界有關，一律用 UTC 存、在應用層轉，不依賴 DB 時區。
+      - "--default-time-zone=+00:00"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      - "${MYSQL_PORT}:3306"
+    healthcheck:
+      # ⚠️ 這裡的 $$ 是給 compose 逃脫用的（compose 會先做一次變數展開），
+      # 少一個 $ 會變成 compose 在自己那一層就換掉，容器裡拿到空字串。
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    volumes:
+      - casino_go_mysql_data:/var/lib/mysql
+      # ⚠️ 這裡**刻意不掛** /docker-entrypoint-initdb.d（2026-08-01 移除）。
+      # 官方映像只在 volume 全新時跑 initdb.d（地雷 #17），所以它天生做不到
+      # 「改 schema」這件事——第二次改欄位就會變成「新環境有、舊環境沒有」，
+      # 而且兩邊都不報錯。schema 現在一律由 goose 管理（docs/ADR-003）：
+      #
+      #   set -a && . deploy/.env && set +a
+      #   go run ./cmd/migrate up
+    networks:
+      - casino-go-network
+
+  # ── MongoDB：CQRS 讀端投影 + 局紀錄 ──────────────────────────────
+  # 定位（docs/ADR-001 §讀端）：讀模型是**反正規化的文件**——一筆玩家儀表板
+  # 資料在關聯式讀庫要 join 五張表，在文件庫就是一份文件一次讀出。
+  # 這是 CQRS 讀端選文件庫的標準理由，不是「因為想用 NoSQL」。
+  #
+  # ⚠️ 讀端是**可重建的衍生資料**：來源是 Kafka 事件，投影壞掉就重放重建。
+  # 因此它沒有備份需求，但也**絕不可以**變成任何資料的唯一真相——
+  # 帳務真相永遠在 MySQL。這條界線一旦模糊，CQRS 就退化成「兩個都是主庫」。
+  mongodb:
+    image: mongo:8.0
+    container_name: casino-go-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: ${MONGO_DATABASE}
+    ports:
+      - "${MONGO_PORT}:27017"
+    healthcheck:
+      # mongosh 從 6.0 起才內建在官方映像裡（更早是 mongo）。
+      # 用 ping 指令而不是「埠通了就算」——mongod 開埠之後還要一段時間
+      # 才真的能接受查詢。
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - casino_go_mongo_data:/data/db
+    networks:
+      - casino-go-network
+
+  # ── Redis：分散式鎖、ZSET 排行榜、原子計數 ───────────────────────
+  # ⚠️ Redis 在本專案**不只是快取，是主儲存**（團隊地雷 #32，藍圖 §6.2 列為
+  # 「A 類：仍然適用，必須帶走」）：
+  #   ① rank:* 排行榜 ZSET —— DB 只有每日快照且無回填程式
+  #   ② 捕魚 session —— Lua CAS 樂觀鎖（團隊 ADR-008，腳本可原樣搬過來）
+  # 所以 `docker compose down -v` 會**砍掉業務資料**，不是清快取。
+  # appendonly 每秒 fsync，最差損失 1 秒寫入。
+  redis:
+    image: redis:7
+    container_name: casino-go-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - casino_go_redis_data:/data
+    networks:
+      - casino-go-network
+
+  # ── Kafka（單節點 KRaft）─────────────────────────────────────────
+  # 設定沿用 lucky-star-notify-go 那份（已在該專案的 Phase 3~5 實戰驗證）。
+  # KRaft = 不需要 ZooKeeper，broker 自己兼任 controller，少一個容器。
+  kafka:
+    image: apache/kafka:4.1.0
+    container_name: casino-go-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:9095
+      # ⚠️ advertised listener 是 client 拿到的「請連這裡」位址，所以它必須是
+      # **client 那一端解析得到的名稱**——而「哪一端」對容器內外是兩個不同的答案：
+      #   PLAINTEXT (9092) 給 compose 網路內的服務      → 容器名 kafka
+      #   HOST      (9095) 給宿主上的契約測試／壓測／CLI → localhost
+      # 只留其中一個，另一端會 bootstrap 連得上但之後每個請求都逾時，
+      # 而錯誤訊息完全指不到這裡。這是 Kafka 容器化最經典的坑。
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:9095
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # 單節點必須把所有 replication factor 降到 1，否則內部 topic
+      # （__consumer_offsets 等）建不起來，broker 起來了卻不能用。
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # topic 由 client 自動建立（wallet 的 writer 帶了 AllowAutoTopicCreation，
+      # 兩邊都要開才成立），省掉一支只會漂移的建 topic 腳本。
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # ⭐ 自動建立的 topic 預設只有 **1 個 partition**，而團隊的 kafka-init.sh
+      # 給高流量 topic（wallet.debit / wallet.credit / wallet.credit.request /
+      # game.result / notification.push）的是 6 個。
+      # ⚠️ 這個值必須在**第一次自動建立之前**就設好：topic 建好之後改 partition 數
+      # 要手動 --alter，而且會改變 key → partition 的對應，等於把既有資料的
+      # 順序保證洗掉。1 個 partition 不會報錯，只會讓「同 group 多開 consumer」
+      # 從第二個開始永遠分不到工作（地雷 #19 的鄰居）。
+      #
+      # ⭐ **這個值是全域的，所以蓋不出 Java 那套三層**（實地讀過 kafka-init.sh）：
+      #
+      #   高流量 5 個 topic                    Java 6 → 本專案 6 ✅ 一致
+      #   低流量 member.registered 等 3 個      Java 3 → 本專案 6 ⚠️ 不同
+      #   DLT 5 個                             Java 1 → 本專案 6 ⚠️ 不同
+      #
+      # **本專案的決定：一律 6，不去複製那套分層**（2026-08-02）。理由：
+      #   ① 兩邊是**完全錯開的獨立叢集**（9092 / 9095），partition 數不同不會
+      #      造成任何跨版問題——會出事的只有「同一個 topic 被兩版同時寫」，
+      #      而那是切換當下的部署決定，不是開發期的事實（見 outbox/publisher.go
+      #      對 Murmur2Balancer 的說明）。
+      #   ② 分層的唯一好處是省下閒置 partition 的 metadata，而 6 vs 1 的差別
+      #      在單節點 broker 上量不出來。
+      #   ③ 要複製那套分層就得養一支建 topic 的腳本，而那支腳本會漂移——
+      #      「topic 少建了一個」的症狀是 consumer 靜靜地收不到訊息（地雷 #19）。
+      # ⚠️ 代價寫清楚：**真的要走「兩版寫同一個 topic」的切換路徑時，
+      # 那些 topic 必須先對齊 partition 數**，否則同一個 playerId 會落到不同
+      # partition（murmur2 % N，N 不同結果就不同）。
+      KAFKA_NUM_PARTITIONS: 6
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+    ports:
+      # 只開 HOST listener；9092 是容器內部通訊，開出去只是多一個沒人用的埠。
+      - "${KAFKA_HOST_PORT}:9095"
+    healthcheck:
+      # 連得上 broker 才回 0，比 `nc -z` 誠實——後者在 broker 還在初始化、
+      # 埠已經開了的那幾秒會誤判成健康。
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+    volumes:
+      - casino_go_kafka_data:/var/lib/kafka/data
+    networks:
+      - casino-go-network
+
+volumes:
+  casino_go_mysql_data:
+  casino_go_mongo_data:
+  casino_go_redis_data:
+  casino_go_kafka_data:
+
+networks:
+  casino-go-network:
+    driver: bridge

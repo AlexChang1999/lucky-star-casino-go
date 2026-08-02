@@ -1,0 +1,218 @@
+# CI/CD —— 每個 PR 與每次進 develop/main 都跑。
+#
+# ⭐ 這份 workflow 存在的理由，是本專案的測試**天生分成兩半**：
+#
+#   go test -race ./...              純邏輯，任何機器都跑得動
+#   go test -race -tags=infra ./...  要真的 MySQL 與 Kafka 才跑得動
+#
+# 而**帳務正確性的證據全部在第二半**（隔離級別、gap lock 死鎖、1062 補償回沖、
+# outbox 的鎖範圍與 filesort）。少了 infra 那個 job，`internal/wallet/store`
+# 在預設 build tag 下是 `[no test files]`——也就是說最關鍵的那包 SQL
+# 覆蓋率是 0，而 CI 會是綠的。**這正是這份檔案要防的事。**
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+# 同一條分支連推兩次時，取消還在跑的舊 run。
+# ⚠️ main/develop 不取消（cancel-in-progress 用條件式）：那兩條分支的 run 會
+# 推映像，取消到一半可能留下只推了一個 tag 的狀態。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# 預設最小權限。要寫 GHCR 的權限只加在 image job 上。
+permissions:
+  contents: read
+
+jobs:
+  # ── ① 靜態檢查 ─────────────────────────────────────────────────────────
+  lint:
+    name: lint（含 infra build tag）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # 版本跟著 go.mod 走，不在這裡寫死第二個真相。
+          go-version-file: go.mod
+          cache: true
+
+      - name: 安裝 golangci-lint
+        # ⚠️ 這裡刻意**不用** golangci-lint-action，而是照 AGENTS.md §4 那行
+        # `go install` 現場編譯。兩個理由：
+        #   ① CI 跑的是與本機**逐字相同**的指令，不是「動作幫你做的某件事」
+        #   ② 官方預編譯的 binary 是用它自己的 Go 版本建的，遇到比它新的
+        #      語言特性會報成語法錯誤，而訊息看起來像你的程式碼壞了
+        # ⚠️ 版本釘死：浮動的 @latest 會讓「今天綠、明天紅」而 commit 沒動過。
+        # 升版是一次刻意的 commit（順便看新 linter 抓到什麼），不是每天的抽獎。
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      - name: golangci-lint run
+        # build tag（infra）寫在 .golangci.yml 的 run.build-tags，這裡不重複第二份。
+        run: golangci-lint run ./...
+
+  # ── ② 單元測試（不需要基礎設施）────────────────────────────────────────
+  unit:
+    name: build / vet / test -race
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet（兩種 build tag 都要）
+        # ⚠️ infra 那次不是多餘的：沒有它，infra 測試檔的編譯錯誤要等到
+        # 有人記得起容器才會發現。vet 不需要 MySQL 就能編譯它們。
+        run: |
+          go vet ./...
+          go vet -tags=infra ./...
+
+      - name: go test -race
+        run: go test -race ./...
+
+  # ── ③ infra 測試（真的 MySQL + 真的 Kafka）★ 本檔的重點 ────────────────
+  infra:
+    name: infra 測試 + 契約測試（Go 目標）
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 準備 deploy/.env
+        # ⚠️ 直接沿用 .env.example 的值（都是 change_me 之類的假密碼）。
+        # runner 是一次性的，而且埠只綁在 runner 自己身上。
+        # ⚠️ 也刻意**不用** GitHub Actions 的 services:，改用專案自己的 compose 檔——
+        # 那樣 CI 跑的才是開發者本機跑的同一份設定（sql_mode、時區、
+        # KAFKA_NUM_PARTITIONS、健康檢查）。用 services: 重寫一份等於多一個
+        # 會漂移的真相，而漂移的方向必定是「CI 過了、本機不過」。
+        run: cp deploy/.env.example deploy/.env
+
+      - name: 起基礎設施
+        # --wait 會等到每個容器的 healthcheck 轉綠才返回（compose 檔裡四個服務
+        # 都有 healthcheck）。少了它，下一步會在 MySQL 還在初始化時就連上去。
+        run: docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env up -d --wait
+
+      - name: 跑 migration
+        # ⚠️ schema **不會**自己出現：compose 已經拿掉 /docker-entrypoint-initdb.d
+        # （地雷 #17、docs/ADR-003），一律由 goose 明確跑一次。
+        run: |
+          set -a && . deploy/.env && set +a
+          go run ./cmd/migrate up
+          go run ./cmd/migrate status
+
+      - name: go test -race -tags=infra
+        run: |
+          set -a && . deploy/.env && set +a
+          go test -race -tags=infra ./...
+
+      - name: 契約測試（Go 目標）
+        # ⭐ 掛在 infra job 裡而不是另開一個 job：契約測試要的東西
+        # （MySQL + Kafka + 已跑完的 migration）這裡全都在了，
+        # 另開一個 job 等於再起一次全部容器換來一個更好看的名字。
+        #
+        # ⚠️ 用 `go build` + 背景執行而不是 `go run &`：`go run` 會**另外** fork
+        # 一個子進程跑編出來的 binary，kill 掉 go run 的 PID 只殺得到父進程，
+        # 服務會繼續佔著埠——症狀是後面的步驟莫名其妙連得上一個「應該已經停掉」的服務。
+        #
+        # ⚠️ java 目標跑不了（需要團隊 repo 的 wallet-service 與 PostgreSQL），
+        # 那條留在本機，跑法見 test/contract/README.md。
+        # 也就是說 **CI 只證明 Go 版沒有回歸，不證明兩版仍然等價**。
+        run: |
+          set -a && . deploy/.env && set +a
+          go build -o /tmp/wallet ./cmd/wallet
+          /tmp/wallet &
+          wallet_pid=$!
+          CONTRACT_TARGET=go go test -tags=contract -count=1 ./test/contract/
+          kill "$wallet_pid"
+
+      - name: 失敗時把容器日誌印出來
+        if: failure()
+        # 沒有這一步的話，CI 紅了只會看到 Go 的錯誤訊息，
+        # 而 MySQL/Kafka 那側發生什麼事完全看不到。
+        run: docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env logs --tail=100
+
+  # ── ④ 映像（CD）────────────────────────────────────────────────────────
+  image:
+    name: 建映像
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # ⚠️ 三個檢查全綠才建映像。PR 上只建不推（驗證 Dockerfile 沒壞），
+    # 進了 develop/main 才推 GHCR。
+    needs: [lint, unit, infra]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        # migrate 也要有映像：schema 不在服務啟動時自動跑（docs/ADR-003），
+        # K8s 那邊是一個獨立的 Job / initContainer，那個 Job 需要一顆映像。
+        service: [wallet, migrate]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 算出映像名稱與 tag
+        id: meta
+        # ⚠️ 兩個都是實際踩過的坑，而且訊息都只說 "invalid reference format"：
+        #   ① github.repository 是 AlexChang1999/lucky-star-casino-go，**含大寫**，
+        #      而 GHCR 的 path 必須全小寫。
+        #   ② pull_request 事件的 github.ref_name 是 **"9/merge"**（合併 ref），
+        #      裡面那個斜線在 Docker tag 是非法字元。第一次跑 CI 就是死在這裡。
+        # 所以 tag 分成兩段：sha 永遠有，分支名只在 push（develop/main，沒有斜線）時加。
+        run: |
+          image="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')/${{ matrix.service }}"
+          tags="$image:${{ github.sha }}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tags="$tags,$image:${{ github.ref_name }}"
+          fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登入 GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build（push 只在 develop/main）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: |
+            SERVICE=${{ matrix.service }}
+            VCS_REF=${{ github.sha }}
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          # GitHub Actions 的建置快取：Go 的依賴下載與編譯結果跨 run 重用。
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+          load: ${{ github.event_name != 'push' }}
+
+      - name: 記錄映像大小
+        # ⭐ 藍圖 §5 第 5 條那張「Java 數百 MB vs Go 數十 MB」的對照圖，
+        # 數字必須是實測的（AGENTS.md §2.7「效能數字一律實測，不可虛構」）。
+        # 印進 job summary，之後要引用時翻得到出處。
+        if: github.event_name != 'push'
+        run: |
+          size=$(docker image inspect ${{ steps.meta.outputs.image }}:${{ github.sha }} --format '{{.Size}}')
+          echo "### ${{ matrix.service }} 映像大小：$((size / 1024 / 1024)) MiB" >> "$GITHUB_STEP_SUMMARY"
