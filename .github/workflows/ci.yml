@@ -84,7 +84,7 @@ jobs:
 
   # ── ③ infra 測試（真的 MySQL + 真的 Kafka）★ 本檔的重點 ────────────────
   infra:
-    name: test -race -tags=infra
+    name: infra 測試 + 契約測試（Go 目標）
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -121,6 +121,26 @@ jobs:
         run: |
           set -a && . deploy/.env && set +a
           go test -race -tags=infra ./...
+
+      - name: 契約測試（Go 目標）
+        # ⭐ 掛在 infra job 裡而不是另開一個 job：契約測試要的東西
+        # （MySQL + Kafka + 已跑完的 migration）這裡全都在了，
+        # 另開一個 job 等於再起一次全部容器換來一個更好看的名字。
+        #
+        # ⚠️ 用 `go build` + 背景執行而不是 `go run &`：`go run` 會**另外** fork
+        # 一個子進程跑編出來的 binary，kill 掉 go run 的 PID 只殺得到父進程，
+        # 服務會繼續佔著埠——症狀是後面的步驟莫名其妙連得上一個「應該已經停掉」的服務。
+        #
+        # ⚠️ java 目標跑不了（需要團隊 repo 的 wallet-service 與 PostgreSQL），
+        # 那條留在本機，跑法見 test/contract/README.md。
+        # 也就是說 **CI 只證明 Go 版沒有回歸，不證明兩版仍然等價**。
+        run: |
+          set -a && . deploy/.env && set +a
+          go build -o /tmp/wallet ./cmd/wallet
+          /tmp/wallet &
+          wallet_pid=$!
+          CONTRACT_TARGET=go go test -tags=contract -count=1 ./test/contract/
+          kill "$wallet_pid"
 
       - name: 失敗時把容器日誌印出來
         if: failure()

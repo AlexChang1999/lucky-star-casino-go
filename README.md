@@ -13,8 +13,8 @@
 
 ## 目前狀態
 
-🚧 **Phase A 施工中**。`wallet` 的帳務核心與事件投遞已可跑，
-契約測試與讀端投影尚未開工。
+🚧 **Phase A 施工中**。`wallet` 的帳務核心、事件投遞與**跨語言契約測試**已可跑，
+讀端投影與 Kafka consumer 尚未開工。
 
 | 項目 | 狀態 |
 |---|---|
@@ -26,7 +26,8 @@
 | `wallet` HTTP 與 `cmd/wallet` | ✅ 逐字對齊 Java 的端點契約 |
 | `wallet` Transactional Outbox → Kafka（poller + 清理排程） | ✅ 端到端實測 208–372ms |
 | CI/CD（lint / 單元 / **infra 測試真的起 MySQL+Kafka** / 建映像） | ✅ 映像實測 36.3 MB |
-| `member.registered` consumer、契約測試、讀端投影 | ⬜ 下一步 |
+| **跨語言契約測試**（`test/contract/`，同一份對兩版都跑） | ✅ **11 項（含 15 個表格子項）Java 與 Go 兩邊全綠** |
+| `member.registered` consumer、讀端投影 | ⬜ 下一步 |
 
 **已完成的前導專案**：`notification-service` →
 [**lucky-star-notify-go**](https://github.com/AlexChang1999/Lucky_Star_Notify_Go)
@@ -139,6 +140,7 @@ docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env down
 | [`docs/ADR-001`](docs/ADR-001-資料層-MySQL-與-MongoDB.md) | 資料層：MySQL + MongoDB |
 | [`docs/ADR-002`](docs/ADR-002-wallet-帳務語句在-MySQL-的等價實作.md) | 帳務語句在 MySQL 的等價實作（沒有 `RETURNING` 怎麼辦） |
 | [`docs/ADR-003`](docs/ADR-003-schema-migration-以-goose-管理.md) | schema migration：goose，且不在啟動時自動跑 |
+| [`test/contract/README.md`](test/contract/README.md) | 跨語言契約測試：怎麼跑、涵蓋什麼、**已知的刻意分歧清單** |
 | [`.claude/agents/`](.claude/agents/README.md) | 三個 subagent 與「為什麼是三個」 |
 
 ---
