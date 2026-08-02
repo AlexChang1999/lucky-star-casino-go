@@ -1,0 +1,33 @@
+# 建置上下文越小，`docker build` 送給 daemon 的東西就越少，快取也越不容易失效。
+#
+# ⚠️ 最重要的兩條是 `.git` 與 `deploy/.env`：
+#   - `.git`（本 repo 目前已數十 MB）每次建置都會整包送進 daemon
+#   - `deploy/.env` 含真實密碼。它進不了最終映像（Dockerfile 沒有 COPY 它），
+#     但**會進建置快取層**——而快取層是可以被 dump 出來的。
+.git
+.gitignore
+.gitattributes
+.github
+
+deploy/.env
+deploy/.env.local
+**/.env
+
+# 文件與說明：改一個字就讓 `COPY . .` 那層失效、整包依賴重抓。
+*.md
+docs/
+.claude/
+
+# 本機產物
+bin/
+*.exe
+*.test
+*.out
+*.prof
+*.pprof
+
+# 編輯器 / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
