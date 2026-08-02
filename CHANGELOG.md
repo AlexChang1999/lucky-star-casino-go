@@ -5,6 +5,95 @@
 
 ---
 
+## [test] — 2026-08-02 — 跨語言契約測試：**第一次有證據說「兩版等價」**
+
+到這一輪為止，「Go 版與 Java 版行為相同」的依據一直只是
+**「我很仔細地讀過 Java 原始碼」**——那不是證據，那是意圖。
+藍圖 §2 原則 4 與 §7 的 Phase DoD 都把契約測試定義成唯一的等價證據，
+而它到現在是 0 行。
+
+**Added：`test/contract/`（build tag `contract`）**
+
+同一份測試碼，`CONTRACT_TARGET=go|java` 切目標。**11 項測試、15 個表格子項，
+兩邊全綠**（Java :8082 / Go :8182，2026-08-02 實跑）。
+
+涵蓋：`/internal/**` 的守門（含「不存在的路徑也要 401」——驗證若跑在路由之後，
+沒有 secret 的人可以靠「401 還是 404」探測端點）、debit/credit 的成功路徑與
+**冪等**、餘額不足 **422**、錢包不存在 404、`subType` 預設 BET、
+11 格 Bean Validation（**連訊息文字都 diff**）。
+
+**⭐ 最重要的一條：跑起來的 Java 不一定是現在的 Java**
+
+第一次跑 java 目標時，`seedWallet` 直接炸在
+`relation "wallet_outbox" does not exist`。往下追出兩件事，**都與程式碼無關、
+都沒有錯誤訊息**：
+
+1. **本機的 `lucky_star_casino-wallet-service` 映像停在 2026-07-18**，
+   而 Transactional Outbox 是 **07-21** 才進 Java repo 的。
+   也就是說當時跑起來的那個「參考實作」**落後原始碼兩週**——
+   拿它當正確答案會得到一個過期的答案，而它回 200，看起來完全正常。
+2. **團隊那顆 PostgreSQL volume 缺 `wallet_outbox` 表**：volume 比那張表老，
+   而 `/docker-entrypoint-initdb.d` **只在 volume 全新時執行**——
+   **地雷 #17 的活體標本**，就長在被拿來當基準的那個環境上。
+
+處置：重建映像（`docker compose build wallet-service`，2026-08-02 版）+
+把 `init.sql` 裡缺的那張表補進本機 PG，然後全部重跑。
+⚠️ 只動團隊 repo 的**本機容器與 volume**，一個 commit 都沒有（AGENTS.md §1）。
+
+> **這兩件事本身就是契約測試的第一個產出**：它證明「參考實作」不是理所當然
+> 存在的東西，而是一個**需要被確認版本**的東西。以後每次跑 java 目標之前
+> 都要先對映像日期（`test/contract/README.md` 有指令）。
+
+**⭐ 第二條：兩條「刻意分歧」已對跑起來的實例複驗**
+
+藍圖 §5 的第 9、10 條當初都標著「Java 行為是**讀原始碼推導的，尚未複驗**」。
+現在複驗完了，**兩條推導都是對的**：
+
+| 情境 | Java（實測） | Go | 藍圖 |
+|---|---|---|---|
+| 壞掉的 JSON | **500** | 400 | §5 第 9 條 ✅ 已複驗 |
+| `playerId: 0` | **404** | 400 | §5 第 10 條 ✅ 已複驗 |
+
+**設計上最重要的一個決定：分歧是欄位，不是 `if`**
+
+已知的刻意分歧一律寫成 `target` 結構的**欄位**（目前兩個），
+測試本體不准出現 `if target.name == "java"`。理由是：
+**契約測試的產出不只是「兩邊都綠」，而是把不等價的地方逼成一份數得出來的清單**。
+散成幾行 if 的話，沒有人數得出來總共有幾個，也不會有人去審查它們該不該存在。
+
+**黑箱的三條硬規矩**
+
+1. **不 import 本專案任何 `internal` 套件**——共用型別就等於共用 bug：
+   兩邊都用同一個 `debitRequest` struct 的話，欄位名打錯會在兩邊以**完全相同的
+   方式**錯掉，而測試是綠的。請求 JSON 一律手寫字串。
+2. **只透過 HTTP 觀察行為**，但**事後從 DB 點算**：回應說 `idempotent: true` 是
+   **實作自己說的**，`流水只有一筆` 才是真的沒有重複入帳。
+3. seed 走 `docker exec`（`mysql` / `psql`）而不是 Go 驅動：一種機制對兩個目標，
+   不必為了 PostgreSQL 引入一個只有測試會用到的依賴。
+
+⚠️ **為什麼契約測試需要直接寫資料庫**：Java 版**沒有任何 HTTP 端點可以建錢包**，
+唯一的路徑是 `member.registered` 事件（`MemberEventListener:30`）。
+等那條路徑重寫完，seed 就能改走事件——那才是完整的黑箱。
+
+**如何驗證**
+
+```
+CONTRACT_TARGET=go   go test -tags=contract -count=1 ./test/contract/   # ok 4.7s
+CONTRACT_TARGET=java go test -tags=contract -count=1 ./test/contract/   # ok 4.0s
+```
+
+**還沒涵蓋（誠實清單，同樣寫在 test/contract/README.md）**
+
+- **事件完全沒驗**：一格都沒有斷言 outbox 列或 Kafka 訊息。
+  **現在兩邊綠只證明 HTTP 契約等價，不證明事件等價。**
+- 409 樂觀鎖衝突（黑箱難以穩定重現，由 store 層的
+  `TestCreditConcurrentSamePlayer` 釘住）。
+- 玩家端點 `/api/v1/wallet/**`（Go 版還沒實作）。
+- ⚠️ 契約測試**尚未進 CI**：`chore/ci-and-image` 那條分支合併後才接得上去，
+  job 片段已經寫在 `test/contract/README.md`，避免兩條分支同時改 `ci.yml`。
+
+---
+
 ## [feat] — 2026-08-02 — outbox poller 與清理排程：Transactional Outbox 的另一半
 
 Phase A 的第五個切片。在這之前 `wallet_outbox` 是**只進不出**的——
