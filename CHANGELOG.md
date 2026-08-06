@@ -5,6 +5,69 @@
 
 ---
 
+## [feat] — 2026-08-06 — Kafka 消費端基礎設施：三條「每一項檢查都正常」的坑釘在啟動時
+
+到這一輪為止，本專案只有**投遞側**（outbox 的 Writer）。要接讀端投影
+（`WalletReadSyncListener` 的 Go 版）、rank 的排行榜更新、admin 的報表，
+四個消費端都要先有同一份 Reader 設定與消費迴圈。
+
+**Added：`internal/platform/kafka`**
+
+| 檔案 | 內容 |
+|---|---|
+| `reader.go` | `NewReader`：consumer group 的 Reader 設定，每個欄位顯式設定 |
+| `consumer.go` | `Consumer`：fetch → handle → commit 的迴圈，含退避與優雅收工 |
+
+**為什麼放 `platform/` 而不是跟 Writer 一樣放在服務底下**：Writer 的設定與
+outbox 的批次大小綁在一起（`BatchSize` 必須等於 poller 的單輪批次量），
+那是 wallet 專屬的；消費端相反——**四個服務都要一份，而每一份的正確性判準完全相同**。
+CLAUDE.md §2 的「有第二個實作才抽象」在這裡已經有四個。
+
+### ⭐ 三條坑的共同形狀：每一項檢查都顯示正常
+
+1. **`WatchPartitionChanges` 預設 false**（地雷 #19）→ consumer 比 topic 早啟動時
+   被分到 **0 個 partition**，而且之後沒有任何事件會觸發 rebalance。
+   healthcheck 過、日誌無錯、`--list` 看得到 group，但 `--describe` 是空的。
+   （Spring Kafka 靠 `metadata.max.age.ms` 每 5 分鐘自己好，所以 Java 版最多慢 5 分鐘。）
+2. **處理失敗不 commit** → offset 卡在那一則壞訊息上，**一則壞訊息讓整個 topic 停擺**，
+   而從外面看只是「某個功能突然沒了」。對齊 Java 的 `finally { ack.acknowledge(); }`。
+3. **收工時用已取消的 ctx 去 commit** → 最後一則必定 commit 失敗、下次開機重播。
+   ⚠️ 這個 bug 只在關機那一瞬間發生，而症狀（重播一則）會被冪等的消費端吃掉，
+   所以它可以存在很久都沒人發現。解法是 `context.WithoutCancel` + 3 秒上限。
+
+另外兩個「照抄會錯」：
+
+- **`StartOffset` 明寫 earliest**：kafka-go 的預設就是 earliest，但
+  **Spring Kafka 的預設是 latest**，兩邊剛好相反。對讀模型投影而言 earliest 才對——
+  從 latest 開始的話，group 建立之前的流水永遠不會進讀端，而且沒有錯誤訊息。
+- **group id 強制 `-go` 後綴，不合就拒絕啟動**（地雷 #22）。
+  ⚠️ 選「檢查並拒絕」而不是「自動補後綴」：自動補的話 `xxx-go` 會變成 `xxx-go-go`，
+  那是一個**全新的 group**，會從頭重放整個 topic。
+
+### ⚠️ 一條刻意留下的分歧：DLT 尚未實作
+
+Spring 那邊處理失敗會由 `DefaultErrorHandler` + `DeadLetterPublishingRecoverer`
+送進 DLT（團隊有 5 個 DLT topic），這裡目前只記一行 ERROR 就往下走——
+也就是**失敗的訊息會被靜靜丟掉**。這是暫時狀態（DLT 的 topic 命名與 payload 形狀
+要照 Java 版查證），**必須在接第一個真的 consumer 時補上**，否則就是無聲的資料遺失。
+已寫在 `Consumer.Run` 的 doc comment 裡，不是只寫在這裡。
+
+**如何驗證**
+
+```bash
+go test -race ./internal/platform/kafka/    # ok, 4.5s（9 個測試 / 17 個表格子項）
+go vet ./... && go vet -tags=infra ./... && golangci-lint run && go build ./...
+```
+
+其中三個測試就是上面三條坑的回歸案例：
+`TestNewReaderPinsSilentDefaults`（與 outbox 的 `TestNewWriterPinsSilentDefaults` 對稱）、
+`TestConsumerCommitsRegardlessOfHandlerOutcome`、
+`TestConsumerCommitsWithUncancelledContext`。
+第三個的假物件會記下 **commit 當下 context 的狀態**——因為那件事從外面看不出來，
+兩種寫法在正常情況下行為完全相同。
+
+---
+
 ## [test] — 2026-08-02 — 跨語言契約測試：**第一次有證據說「兩版等價」**
 
 到這一輪為止，「Go 版與 Java 版行為相同」的依據一直只是
