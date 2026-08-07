@@ -67,11 +67,19 @@ func TestMigrationsApplyFromEmptyDatabase(t *testing.T) {
 	})
 
 	t.Run("down 之後表消失且版本檢查會擋", func(t *testing.T) {
-		if _, err := provider.Down(ctx); err != nil {
+		// ⚠️ provider.Down 只退**一步**（最新那個 migration）。這個測試要驗的是
+		// 「完全空的資料庫」，不是「退一步」，所以要用 DownTo(0) 退到底——
+		// 這樣寫也讓測試不會因為之後又加了 00003、00004 而又要改一次（地雷：
+		// 曾經誤用 Down() 只在剛好只有一個 migration 檔時「碰巧」等於退到底，
+		// 加了 00002 之後這個假設就不成立了）。
+		if _, err := provider.DownTo(ctx, 0); err != nil {
 			t.Fatalf("回退失敗: %v", err)
 		}
 		if mysqltest.TableExists(ctx, t, db, "wallets") {
 			t.Error("down 之後 wallets 應該不存在")
+		}
+		if mysqltest.TableExists(ctx, t, db, "diamond_wallets") {
+			t.Error("down 之後 diamond_wallets 應該不存在")
 		}
 		if err := VerifyVersion(ctx, db); err == nil {
 			t.Error("回退之後 VerifyVersion 應該擋下，卻通過了")

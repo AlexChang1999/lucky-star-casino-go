@@ -54,9 +54,15 @@ golangci-lint run                          # 0 issues
 
 `internal/wallet/store/wallet_creation_infra_test.go`（`-tags=infra`）新增
 `TestCreateWalletIsIdempotent`、`TestCreateDiamondWalletIsIdempotent`，以及
-比照 `TestDebitConcurrentSameKey` 形狀的併發重複建立測試——這幾個測試需要
-本機 MySQL 容器起來才能跑，這一輪撰寫時本機 Docker Desktop 未啟動，**尚未
-實際跑過**，下次起 infra 時要優先確認綠燈。
+比照 `TestDebitConcurrentSameKey` 形狀的併發重複建立測試——已對本機 MySQL
+容器實跑 `go test -race -tags=infra ./...` 確認全綠。
+
+⚠️ **意外連帶修好一個測試**：`internal/platform/migrate` 的
+`TestMigrationsApplyFromEmptyDatabase` 用 `provider.Down(ctx)` 驗「回退後表
+消失」，但 `Down` 只退**一步**——只有一個 migration 檔時剛好等於退到底，
+加了 00002 之後這個假設就不成立（`Down()` 只會把 diamond_wallets 退掉，
+wallets 還在）。改成 `DownTo(ctx, 0)` 退到底，並補上 diamond_wallets 的斷言，
+避免下一個 migration 又讓它悄悄失效。
 
 **契約測試不動**：`seedWallet` 仍是直接種 DB，改成發 `member.registered` 事件
 是下一個切片的工作（測試 harness 需要能發 Kafka、能 poll 直到可見，跟這輪
