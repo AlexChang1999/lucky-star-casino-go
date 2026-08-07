@@ -23,9 +23,12 @@ import (
 	"time"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/config"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/kafka"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/migrate"
 	platformstore "github.com/AlexChang1999/lucky-star-casino-go/internal/platform/store"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/httpapi"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/memberconsume"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/outbox"
 	walletstore "github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
 )
@@ -73,7 +76,6 @@ func run() error {
 	// ⚠️ 一定要收 SIGTERM，那是 `docker stop` 與 K8s 送的訊號。只收 SIGINT
 	// 的話容器每次都會被等到寬限期結束再 SIGKILL——而 SIGKILL 不會送
 	// Kafka 的 LeaveGroup，於是留下幽靈 member（AGENTS.md 地雷 #25）。
-	// 這個服務目前還沒有 consumer，但這個習慣要從第一個服務就建立。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -135,13 +137,27 @@ func run() error {
 	poller := outbox.NewPoller(repo, publisher.Publish, walletCfg.Outbox, logger)
 	purger := outbox.NewPurger(repo, walletCfg.Outbox.Retention, logger)
 
+	// ── member.registered 消費端（AGENTS.md 地雷 #19/#20/#22/#25/#38/#40）──
+	// wallet 服務**唯一**建立錢包的路徑：沒有任何 HTTP 端點會 lazy-create。
+	memberReader, err := kafka.NewReader(
+		kafkaCfg.Brokers, domain.TopicMemberRegistered, kafkaCfg.MemberRegisteredGroupID, logger)
+	if err != nil {
+		return err
+	}
+	memberHandler := memberconsume.NewHandler(repo, kafkaCfg.Brokers, logger)
+	memberConsumer := kafka.NewConsumer(memberReader, "wallet-member-registered", memberHandler.Handle, logger)
+
 	// ⚠️ 收工順序是**由外往內**，而且不能靠 defer 的 LIFO 去湊：
-	//   ① serve 返回（ctx 已取消）→ ② 等兩個背景 goroutine 跑完當前這一輪
-	//   → ③ 關 Kafka writer → ④ 關 MySQL（上面那個 defer，LIFO 排在最後）
+	//   ① serve 返回（ctx 已取消）→ ② 等三個背景 goroutine 跑完當前這一輪
+	//   → ③ 關 member consumer 與它的 DLT writer → ④ 關 outbox Kafka writer
+	//   → ⑤ 關 MySQL（上面那個 defer，LIFO 排在最後）
 	// 順序反了的症狀都很難查：先關 writer，最後一輪會把已寫入 DB 的事件
-	// 誤判成投遞失敗；先關 DB，poller 會在標記 SENT 那一步炸掉。
+	// 誤判成投遞失敗；先關 DB，poller 會在標記 SENT 那一步炸掉。member
+	// consumer 排在 outbox writer 之前關，是因為它讀 Kafka、跟 outbox 寫
+	// Kafka 邏輯上獨立，但兩者都是「先停背景 goroutine、才收尾巴的 Kafka
+	// 資源」，跟著同一個外往內的次序走，比另外發明一套順序更好記。
 	var background sync.WaitGroup
-	background.Add(2)
+	background.Add(3)
 	go func() {
 		defer background.Done()
 		poller.Run(ctx)
@@ -150,8 +166,20 @@ func run() error {
 		defer background.Done()
 		purger.Run(ctx)
 	}()
+	go func() {
+		defer background.Done()
+		if err := memberConsumer.Run(ctx); err != nil {
+			logger.Error("member.registered consumer 意外結束", "err", err)
+		}
+	}()
 	defer func() {
 		background.Wait()
+		if err := memberConsumer.Close(); err != nil {
+			logger.Error("關閉 member.registered consumer 失敗", "err", err)
+		}
+		if err := memberHandler.Close(); err != nil {
+			logger.Error("關閉 member.registered DLT writer 失敗", "err", err)
+		}
 		if err := publisher.Close(); err != nil {
 			logger.Error("關閉 Kafka writer 失敗", "err", err)
 		}

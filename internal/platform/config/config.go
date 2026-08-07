@@ -104,6 +104,16 @@ type Kafka struct {
 	// metadata，拿到真正的 broker 位址（那些位址由 advertised.listeners 決定，
 	// 見 compose 檔裡的說明）。
 	Brokers []string
+
+	// MemberRegisteredGroupID 是 wallet 消費 member.registered 的 consumer
+	// group id。⚠️ 必須以 "-go" 結尾——internal/platform/kafka.NewReader 會擋
+	// 不合這個規則的值（地雷 #22：跟 Java 共用 group id 會讓 partition 被兩版
+	// 瓜分，看起來像「Go 版隨機漏訊息」的假 bug）。
+	//
+	// 目前只有 wallet 一個 consumer，所以直接放在 Kafka 這個共用 struct 上；
+	// 等第二個服務也要消費事件時再考慮要不要拆成 per-service 的子結構
+	// （CLAUDE.md §2：抽象要等第二個實例，不要提前設計）。
+	MemberRegisteredGroupID string
 }
 
 // LoadKafka 載入事件匯流排設定。
@@ -124,7 +134,11 @@ func LoadKafka() (Kafka, error) {
 		// 但「設了一個解析出來是空的值」是打錯字，不該被靜默當成沒設。
 		return Kafka{}, fmt.Errorf("KAFKA_BOOTSTRAP_SERVERS=%q 解析不出任何位址", raw)
 	}
-	return Kafka{Brokers: brokers}, nil
+
+	// Java 是 "wallet-service-group"，這裡加 "-go" 後綴（地雷 #22）。
+	groupID := stringEnv("WALLET_MEMBER_REGISTERED_GROUP_ID", "wallet-service-group-go")
+
+	return Kafka{Brokers: brokers, MemberRegisteredGroupID: groupID}, nil
 }
 
 // LoadMySQL 只載入帳務寫入主庫的設定。

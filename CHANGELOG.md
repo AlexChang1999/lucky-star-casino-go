@@ -5,6 +5,65 @@
 
 ---
 
+## [feat] — 2026-08-07 — wallet 消費 member.registered，建立星幣與鑽石錢包
+
+到這一輪為止，wallet 服務**不會自己建立錢包**：手動測試要自己 `INSERT INTO
+wallets`，契約測試的 `seedWallet` 也是直接種 DB。Java 版錢包建立的唯一路徑
+是 `member.registered` 事件（`MemberEventListener` → `WalletService.createWallet`
++ `DiamondWalletService.createDiamondWallet`），沒有任何 HTTP 端點會 lazy-create。
+這一輪把這條路徑接上，也是 8/6 完成的 `internal/platform/kafka` 消費端基礎設施
+第一次真的被服務使用。
+
+**Added**
+
+| 檔案 | 內容 |
+|---|---|
+| `internal/platform/migrate/migrations/00002_diamond_wallets.sql` | 新表，與 `wallets` 平行，刻意沒有 `frozen_amount`（對齊 Java 的 DiamondWallet entity） |
+| `internal/wallet/domain/member_event.go` | `MemberRegisteredEvent`、`TopicMemberRegistered` |
+| `internal/wallet/store` 新增 `Repository.CreateWallet` / `CreateDiamondWallet` | 冪等建立，見下方「冪等機制」 |
+| `internal/wallet/memberconsume` | 新套件：`Handler`（重試 + DLT）、`dltWriter` |
+| `cmd/wallet/main.go` | 接上第三個背景 goroutine（consumer），收工順序跟著外往內原則擴充 |
+
+**冪等機制——刻意比 Java 精簡**：Java 是 `existsById` 預檢 + catch
+`DataIntegrityViolationException` 兩層防護（`existsById` 跟後面的 `saveAndFlush`
+中間有 race，得靠 catch 兜底）。Go 版直接靠 `player_id` 的 PRIMARY KEY 衝突
+一次到位，撞到 MySQL 1062 就當冪等命中吞掉（`isDupEntry`，AGENTS.md 地雷 #26
+既定教條的套用，不是新設計）。星幣與鑽石兩個 INSERT **不包在同一筆交易**，
+對齊 Java 兩個獨立 `saveAndFlush` 的形狀——各自冪等，其中一個失敗不影響另一個，
+訊息重送會自然補完沒做完的那一步。
+
+**重試時距刻意跟 Java 不同**：Java 的 `FixedBackOff(2000ms, 3)` 在 Kafka
+redelivery 層跑，不受單則處理時間限制；Go 版的重試在 `Handler.Handle` 內部跑
+（`internal/platform/kafka.Consumer` 沒有內建重試，且「不論成功失敗都
+commit」是既定不變量，重試只能發生在 commit 之前）,受 10 秒的 `handleTimeout`
+限制，因此改用 3 次、每次 500ms。這是工程時距常數，不是業務口徑。
+
+**DLT——刻意跟 Java 一樣「發了沒人收」**：Java 的 `DeadLetterListener` 對
+`wallet.credit.DLT`/`wallet.debit.DLT`/`wallet.credit.request.DLT` 都有對應
+listener，唯獨沒有 `member.registered.DLT` 的。Go 版照抄這個行為，不建一個
+沒人查的 DLT reader（那是這個切片之外的過度設計），但新增 AGENTS.md 地雷 #40
+把這件事寫清楚，不讓它看起來像漏做。
+
+**驗證**：
+
+```
+go vet ./... && go vet -tags=infra ./...   # 皆無輸出
+go test -race ./...                        # 全綠，含 memberconsume 新增的 6 個測試
+golangci-lint run                          # 0 issues
+```
+
+`internal/wallet/store/wallet_creation_infra_test.go`（`-tags=infra`）新增
+`TestCreateWalletIsIdempotent`、`TestCreateDiamondWalletIsIdempotent`，以及
+比照 `TestDebitConcurrentSameKey` 形狀的併發重複建立測試——這幾個測試需要
+本機 MySQL 容器起來才能跑，這一輪撰寫時本機 Docker Desktop 未啟動，**尚未
+實際跑過**，下次起 infra 時要優先確認綠燈。
+
+**契約測試不動**：`seedWallet` 仍是直接種 DB，改成發 `member.registered` 事件
+是下一個切片的工作（測試 harness 需要能發 Kafka、能 poll 直到可見，跟這輪
+「consumer + 2 個 repo 方法 + migration」不是同一個粒度）。
+
+---
+
 ## [feat] — 2026-08-06 — Kafka 消費端基礎設施：三條「每一項檢查都正常」的坑釘在啟動時
 
 到這一輪為止，本專案只有**投遞側**（outbox 的 Writer）。要接讀端投影
