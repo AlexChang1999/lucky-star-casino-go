@@ -22,6 +22,84 @@
 
 ---
 
+## [feat] — 2026-08-13 — wallet 的 Redis 額度層（當日領取鎖與贈禮額度）
+
+Java 版 `wallet-service` 的 Redis 使用面逐檔查證後**剛好三個 key**
+（`docs/notes/Java版-Redis-用途全解.md` §2.4）：`wallet:bankruptcy-aid:{id}:{date}`、
+`wallet:gift:sent:{id}:{date}`、`wallet:gift:recv:{id}:{date}`。
+這一輪把三個全部實作完，歸納成兩個原語——**一次性宣告**（`SET NX PX`）與
+**可回補的額度預扣**（Lua 包住 `INCRBY` + TTL + 上限檢查 + 回補）。
+
+⚠️ **這一層不是快取**。三個 key 都是額度狀態本身，沒有任何地方可以重算出
+「這個玩家今天已經送出多少」。差別體現在故障策略：快取掉了該 fail-open
+（回源頭重算），額度狀態掉了必須 **fail-closed**。兩個 Reserve 都 fail-closed，
+與 Java 一致——但 Java 那邊是「沒有人寫 catch」的副作用，這裡是**有測試釘住的
+行為**（`TestFailsClosedWhenRedisIsDown`）。
+
+**Added**
+
+| 檔案 | 內容 |
+|---|---|
+| `internal/wallet/quota/quota.go` | `Store`：`ClaimBankruptcyAid` / `ReleaseBankruptcyAid` / `ReserveGiftQuota` / `ReleaseGiftQuota`，兩段 Lua |
+| `internal/wallet/quota/daykey.go` | 台北日界、午夜 TTL、`_ "time/tzdata"` |
+| `internal/platform/redistest/` | infra 測試共用的 Redis 隔離（DB 15 + 唯一玩家 ID，**刻意不提供任何 flush 函式**） |
+| `internal/platform/config` 新增 `LoadRedis()` | 理由同 `LoadMySQL` / `LoadKafka` 從 `LoadInfra` 拆出來 |
+
+**四處刻意分歧（都是修 bug，不是品味）**，全部由 infra 測試釘住：
+
+1. **TTL 與計數在同一個原子操作裡**。Java 的 `ensureMidnightExpiry` 是
+   `INCRBY` → `TTL` → `EXPIREAT` 三個往返，進程死在中間會留下**永不過期**的 key
+   → 該玩家**從此送不出禮物**。（同 repo 的 `BankruptcyAidService` 註解自己
+   寫著要避免這件事，只是 gift 沒照做。）
+2. **回補不製造永久負數計數器**。`DECRBY` 打在**已過期**的 key 上會**重新建立**
+   它、值為負、**且無 TTL**（Java 的 release 路徑不補設 TTL）。觸發條件只要
+   「預扣與回補之間跨過午夜」，後果是那個玩家隔天額度變成 `5000 + 該筆金額`，
+   **永久**。這裡加 `EXISTS` 檢查 + 夾在 0 + `SET ... KEEPTTL`。
+3. **兩個 key 一起成功或一起失敗**。Java 的 `reserveDailyQuota` 在 `gift()` 的
+   try 區塊**之外**，第二次 `INCRBY` 失敗時第一次的預扣不會被回補。
+4. **超限回補與計數同屬一個原子單位**，於是併發時不會誤拒別人。
+
+**⚠️ 一個被實測推翻的假設（記錄下來因為它有教學價值）**：最初寫的註解宣稱
+「拿掉 Lua 就會超收」。做了對照實驗之後**證明是錯的**——`INCRBY` 本身原子且
+**回傳遞增後的新值**，admission 決策早就被 Redis 的單執行緒序列化了，
+Java 的 javadoc「多計只會讓額度更嚴格、不會讓玩家超額」是對的。
+Lua 真正買到的是**不誤拒**：
+
+| | 小額請求被誤拒次數 / 60 輪（每輪 8 筆大額併發干擾） |
+|---|---|
+| Lua 原子版 | **0、0** |
+| Java 形狀（非原子） | **46、49**（約 77~82%） |
+
+（實測環境：本機 Redis 7.4.9，`-race`，`-count=2`。）
+誤拒的症狀最惡劣：玩家收到 422「你今天送太多了」但額度其實還有，
+而且**重試就會成功**，所以客服重現不出來。
+
+**tzdata 實測**（`CGO_ENABLED=0 GOOS=linux`，兩顆 binary 放進同一個 scratch 映像）：
+
+| | 結果 | binary 大小 |
+|---|---|---|
+| 無 `_ "time/tzdata"` | `FAIL: unknown time zone Asia/Taipei`（exit 1） | 1,650,850 bytes |
+| 有 `_ "time/tzdata"` | `OK: Asia/Taipei 2026-08-13T12:00:00+08:00` | 2,060,450 bytes |
+
+代價 **+400 KiB**，換掉一個「本機與 CI 全綠、只有部署上去才炸」的失敗模式。
+Dockerfile 早就預告過這件事（scratch 沒有 tzdata），這是第一個真的需要時區的切片。
+
+**⚠️ 日界時區是業務語義，不可換算成 UTC**——這是地雷 #39 的**鏡像**：
+排程時間要換算（`@Scheduled` 的 4 點是台北凌晨，UTC 要寫 20），
+但「今天有沒有領過」是**台北的今天**，改成 UTC 會讓日界移到早上 8 點，
+玩家在 07:59 領過之後 08:00 又能再領一次。
+
+**尚未接上 HTTP**：Java 的 `POST /api/v1/wallet/bankruptcy-aid` 是**公開端點、
+playerId 從 JWT 來**，而 Go 版 wallet 目前只有 `/internal/**` + `X-Internal-Secret`。
+硬接等於發明契約，所以端點留給 gateway/JWT 那一輪。贈禮還額外需要雙向分錄
+（`GiftTransferService`），那是獨立的帳務切片。
+
+**如何驗證**：`go vet ./...`、`go vet -tags=infra ./...`、`go test -race ./...`、
+`golangci-lint run`（0 issues）、`go build ./...` 全過；
+`go test -race -tags=infra ./...` 全套綠（quota 3.2s、wallet/store 37.9s）。
+
+---
+
 ## [feat] — 2026-08-07 — wallet 消費 member.registered，建立星幣與鑽石錢包
 
 到這一輪為止，wallet 服務**不會自己建立錢包**：手動測試要自己 `INSERT INTO

@@ -178,6 +178,23 @@ func LoadMySQL() (MySQL, error) {
 	return cfg, errors.Join(errs...)
 }
 
+// LoadRedis 只載入 Redis 的設定。
+//
+// 為什麼要跟 LoadInfra 分開，理由與 LoadMySQL / LoadKafka 完全相同：
+// 只用得到 Redis 的程式（wallet 的額度層、之後的 rank 與 gateway）不該因為
+// `MONGO_ROOT_PASSWORD` 沒設而拒絕啟動——那個錯誤訊息與它要做的事無關。
+//
+// ⚠️ 這裡**沒有帳號密碼**，因為 compose 起的 Redis 沒開 requirepass。
+// 那是開發環境的選擇，不是「Redis 不需要密碼」。真的要上線時這裡會多兩個
+// 必填欄位，而**不設就不給啟動**（照 LoadMySQL 對 MYSQL_PASSWORD 的作法）。
+func LoadRedis() (Redis, error) {
+	port, err := intEnv("REDIS_PORT", 6380)
+	if err != nil {
+		return Redis{}, err
+	}
+	return Redis{Host: stringEnv("REDIS_HOST", "localhost"), Port: port}, nil
+}
+
 // LoadInfra 從環境變數讀取設定並驗證。
 //
 // 回傳的 error 可能包含多個問題（errors.Join）——一次看完比修一個跑一次快。
@@ -188,7 +205,7 @@ func LoadInfra() (Infra, error) {
 	errs = append(errs, err)
 	mongoPort, err := intEnv("MONGO_PORT", 27018)
 	errs = append(errs, err)
-	redisPort, err := intEnv("REDIS_PORT", 6380)
+	redisCfg, err := LoadRedis()
 	errs = append(errs, err)
 
 	cfg := Infra{
@@ -200,10 +217,7 @@ func LoadInfra() (Infra, error) {
 			Password: os.Getenv("MONGO_ROOT_PASSWORD"),
 			Database: stringEnv("MONGO_DATABASE", "lucky_star_read"),
 		},
-		Redis: Redis{
-			Host: stringEnv("REDIS_HOST", "localhost"),
-			Port: redisPort,
-		},
+		Redis: redisCfg,
 	}
 
 	// MySQL 的必填由 LoadMySQL 驗過了，這裡只補 Mongo 的。
