@@ -12,17 +12,34 @@
 // `GlobalExceptionHandler`、`ApiResponse`、`InternalSecretFilter`）。不要照直覺改。
 package handler
 
-import "log/slog"
+import (
+	"context"
+	"errors"
+	"log/slog"
 
-// Handler 持有這一層的依賴。業務端點各自在 debit.go / credit.go 掛上來。
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/service"
+)
+
+// WalletService 是這一層需要的應用能力，定義在消費端（CLAUDE.md §2）。
+// *service.Service 不知道這個介面存在。
+type WalletService interface {
+	Debit(ctx context.Context, m domain.Movement) (service.DebitResult, error)
+}
+
+// Handler 持有這一層的依賴。沒有第三個——有第三個就代表有邏輯跑錯層了。
 type Handler struct {
+	svc    WalletService
 	logger *slog.Logger
 }
 
 // New 組出 Handler。logger 為 nil 時退回 slog.Default()。
-func New(logger *slog.Logger) *Handler {
+func New(svc WalletService, logger *slog.Logger) (*Handler, error) {
+	if svc == nil {
+		return nil, errors.New("handler.New: svc 不可為 nil")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handler{logger: logger}
+	return &Handler{svc: svc, logger: logger}, nil
 }

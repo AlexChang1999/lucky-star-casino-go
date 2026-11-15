@@ -6,6 +6,9 @@ import "github.com/gofiber/fiber/v3"
 const (
 	internalErrorMessage = "Internal server error"
 	unauthorizedMessage  = "Unauthorized"
+
+	// ⚠️ malformedBodyMessage 是**本專案自己的**訊息，Java 沒有對應物（見 debit.go 的註解）。
+	malformedBodyMessage = "Invalid request body"
 )
 
 // envelope 對齊 Java 的 `com.luckystar.wallet.common.ApiResponse`。
@@ -18,6 +21,10 @@ type envelope struct {
 	Success bool    `json:"success"`
 	Data    any     `json:"data"`
 	Message *string `json:"message"`
+}
+
+func respondOK(c fiber.Ctx, data any) error {
+	return c.Status(fiber.StatusOK).JSON(envelope{Success: true, Data: data})
 }
 
 func respondError(c fiber.Ctx, status int, message string) error {

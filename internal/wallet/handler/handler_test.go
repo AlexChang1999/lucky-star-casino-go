@@ -22,8 +22,12 @@ func testConfig() config.HTTPServer {
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-func newTestApp(t *testing.T, h *Handler) *fiber.App {
+func newTestApp(t *testing.T, svc WalletService) *fiber.App {
 	t.Helper()
+	h, err := New(svc, discardLogger())
+	if err != nil {
+		t.Fatalf("組裝 handler 失敗: %v", err)
+	}
 	app, err := NewApp(h, testSecret, testConfig())
 	if err != nil {
 		t.Fatalf("組裝 app 失敗: %v", err)
@@ -73,7 +77,7 @@ func TestInternalSecret(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			app := newTestApp(t, New(discardLogger()))
+			app := newTestApp(t, &fakeService{})
 			status, body := send(t, app, tt.method, tt.path, `{}`, tt.secret)
 			if status != tt.wantStatus {
 				t.Fatalf("狀態碼 = %d, want %d（body=%s）", status, tt.wantStatus, body)
@@ -91,8 +95,15 @@ func TestInternalSecret(t *testing.T) {
 
 // TestNewAppRejectsEmptySecret 釘住「設定漏了就開不起來」。
 func TestNewAppRejectsEmptySecret(t *testing.T) {
-	if _, err := NewApp(New(discardLogger()), "", testConfig()); err == nil {
+	h, err := New(&fakeService{}, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewApp(h, "", testConfig()); err == nil {
 		t.Fatal("internalSecret 為空時 NewApp 必須回錯誤")
+	}
+	if _, err := New(nil, discardLogger()); err == nil {
+		t.Fatal("svc 為 nil 時 New 必須回錯誤")
 	}
 	if _, err := NewApp(nil, testSecret, testConfig()); err == nil {
 		t.Fatal("handler 為 nil 時 NewApp 必須回錯誤")
@@ -100,7 +111,7 @@ func TestNewAppRejectsEmptySecret(t *testing.T) {
 }
 
 func TestHealthz(t *testing.T) {
-	app := newTestApp(t, New(discardLogger()))
+	app := newTestApp(t, &fakeService{})
 	status, body := send(t, app, http.MethodGet, "/healthz", "", nil)
 	if status != http.StatusOK || body != `{"status":"ok"}` {
 		t.Errorf("healthz = %d %s, want 200 {\"status\":\"ok\"}", status, body)
