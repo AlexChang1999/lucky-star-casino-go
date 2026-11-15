@@ -5,6 +5,23 @@
 
 ---
 
+## [chore] — 2026-11-12 — Go 工具鏈升到 1.26.11（同線升 patch）
+
+`go.mod` 與 `Dockerfile` 的 Go 版本由 1.26.5 升到 **1.26.11**；本機安裝也由 1.25.9
+（已不在官方支援範圍）升到 1.26.11，`go version` 與 `go.mod` 從此一致，不再靠
+`GOTOOLCHAIN=auto` 在背景下載。
+
+- **為什麼是 1.26.11 而不是 1.27.4**：Go 沒有 LTS，官方只維護最新兩條 minor 線。
+  這一輪只要安全修補，不要同時吃進一個新的 minor 的行為變動。
+- **為什麼用 go.dev 的 MSI 而不是 winget**：winget 只收錄到 1.26.7。安裝前已用
+  `go.dev/dl/?mode=json` 的 sha256 比對安裝檔。
+- 版本釘在 `go.mod`、`Dockerfile` 兩處；CI 讀 `go-version-file: go.mod`，不用另外改。
+- **如何驗證**：`go vet ./...`、`go vet -tags=infra ./...`、`go build ./...`、
+  `go test -race ./...`、`golangci-lint run`（0 issues）全過；
+  `golang:1.26.11-alpine` 映像 tag 確認存在。未跑 `-tags=infra` 測試與映像建置。
+
+---
+
 ## [feat] — 2026-08-07 — wallet 消費 member.registered，建立星幣與鑽石錢包
 
 到這一輪為止，wallet 服務**不會自己建立錢包**：手動測試要自己 `INSERT INTO

@@ -11,7 +11,7 @@
 # ⚠️ 版本要**釘死到 patch**。浮動的 `golang:1.26` 有天會滾到一個新版本，
 # 於是「同一個 commit 建出不同的 binary」，而 CI 是綠的——這種不可重現性
 # 要到出事時才會有人想起來查建置環境。
-FROM golang:1.26.5-alpine AS build
+FROM golang:1.26.11-alpine AS build
 
 # ca-certificates 不是給建置用的，是要**複製進最終映像**的（見下方執行階段）。
 #
