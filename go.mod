@@ -1,6 +1,6 @@
 module github.com/AlexChang1999/lucky-star-casino-go
 
-go 1.26.5
+go 1.26.11
 
 require (
 	github.com/gin-gonic/gin v1.12.0
