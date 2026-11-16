@@ -1,6 +1,12 @@
 package handler
 
 import (
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/model/dto/output"
+
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/model/dto/input"
+
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/apiprotocol"
+
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
@@ -8,28 +14,8 @@ import (
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
 )
 
-type creditRequest struct {
-	PlayerID       *int64  `json:"playerId"`
-	Amount         *int64  `json:"amount"`
-	SubType        *string `json:"subType"`
-	IdempotencyKey string  `json:"idempotencyKey"`
-	ReferenceID    string  `json:"referenceId"`
-	UnfreezeAmount *int64  `json:"unfreezeAmount"`
-}
-
-// ⚠️ 欄位順序刻意與 Java 的 CreditResponse 一致。
-type creditResponse struct {
-	TransactionID int64  `json:"transactionId"`
-	PlayerID      int64  `json:"playerId"`
-	Amount        int64  `json:"amount"`
-	BalanceBefore int64  `json:"balanceBefore"`
-	BalanceAfter  int64  `json:"balanceAfter"`
-	FrozenAfter   *int64 `json:"frozenAfter"`
-	Idempotent    bool   `json:"idempotent"`
-}
-
-// toMovement 把入帳請求翻成一次已驗證的帳務意圖。
-func (r creditRequest) toMovement() (domain.Movement, error) {
+// creditToMovement 把入帳請求翻成一次已驗證的帳務意圖。
+func creditToMovement(r input.CreditReq) (domain.Movement, error) {
 	if err := checkCommon(r.PlayerID, r.Amount, r.IdempotencyKey, r.ReferenceID); err != nil {
 		return domain.Movement{}, err
 	}
@@ -37,7 +23,7 @@ func (r creditRequest) toMovement() (domain.Movement, error) {
 	// credit 的 subType 是 @NotBlank + @Pattern，沒有預設值——入帳來源太多元
 	// （中獎、簽到、任務、GM 補發…），沒有一個「合理的預設」。
 	if r.SubType == nil || strings.TrimSpace(*r.SubType) == "" {
-		return domain.Movement{}, fieldError{field: "subType", message: msgNotBlank}
+		return domain.Movement{}, fieldError{field: "subType", message: apiprotocol.MustNotBeBlank}
 	}
 
 	// ⚠️ 未帶時是 0，對齊 Java 的 `getUnfreezeAmount() == null ? 0L : ...`。
@@ -63,12 +49,12 @@ func (r creditRequest) toMovement() (domain.Movement, error) {
 
 // Credit 對應 Java 的 `POST /internal/wallet/credit`。
 func (h *Handler) Credit(c fiber.Ctx) error {
-	var req creditRequest
+	var req input.CreditReq
 	if err := c.Bind().JSON(&req); err != nil {
-		return respondError(c, fiber.StatusBadRequest, malformedBodyMessage) // 理由見 Debit
+		return respondError(c, fiber.StatusBadRequest, apiprotocol.InvalidRequestBody) // 理由見 Debit
 	}
 
-	m, err := req.toMovement()
+	m, err := creditToMovement(req)
 	if err != nil {
 		return h.respondValidationError(c, err)
 	}
@@ -78,7 +64,7 @@ func (h *Handler) Credit(c fiber.Ctx) error {
 		return h.respondServiceError(c, err, m)
 	}
 
-	return respondOK(c, creditResponse{
+	return respondOK(c, output.CreditRes{
 		TransactionID: r.TransactionID,
 		PlayerID:      r.PlayerID,
 		Amount:        r.Amount,

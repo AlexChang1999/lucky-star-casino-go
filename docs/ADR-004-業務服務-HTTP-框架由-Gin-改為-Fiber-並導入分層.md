@@ -7,6 +7,7 @@
 | **決策者** | 單人（作品集專案） |
 | **影響範圍** | 業務服務的 HTTP 層。wallet 是第一個（`internal/wallet/handler`、`internal/wallet/service`） |
 | **Supersedes** | `docs/藍圖.md` §3 的「Gin ✅ 做 / Echo、Fiber ❌ 不做」兩列 |
+| **後續** | 2026-11-16 起，套件命名（`store` → `repository`、`model/dto`、`apiprotocol`）由 `docs/ADR-006` 取代；本檔的框架選擇與分層方向不變 |
 
 ---
 

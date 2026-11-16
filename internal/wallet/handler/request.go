@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/apiprotocol"
+
 	"errors"
 	"strings"
 	"unicode/utf8"
@@ -27,18 +29,8 @@ type fieldError struct {
 }
 
 func (e fieldError) Error() string {
-	return "Invalid request: " + e.field + " " + e.message
+	return apiprotocol.InvalidRequestPrefix + e.field + " " + e.message
 }
-
-// Bean Validation 的預設訊息。逐字對齊，因為它們會直接出現在回應 body 裡。
-const (
-	msgNotNull  = "must not be null"
-	msgNotBlank = "must not be blank"
-	msgPositive = "must be greater than 0"
-	msgSize100  = "size must be between 0 and 100"
-
-	msgPositiveOrZero = "must be greater than or equal to 0"
-)
 
 // endpoint 帶著端點唯一不同的東西：subType 的 @Pattern 白名單訊息。
 //
@@ -51,11 +43,10 @@ type endpoint struct {
 
 var (
 	debitEndpoint = endpoint{
-		subTypeMessage: "subType must be one of BET/SHOP_PURCHASE",
+		subTypeMessage: apiprotocol.DebitSubType,
 	}
 	creditEndpoint = endpoint{
-		subTypeMessage: "subType must be one of WIN/CHECKIN/TASK/GIFT/GM_REWARD/" +
-			"BANKRUPTCY_AID/DIAMOND_EXCHANGE/TOPUP/CASHBACK/REFUND/MONTHLY_REWARD",
+		subTypeMessage: apiprotocol.CreditSubType,
 	}
 )
 
@@ -70,18 +61,18 @@ func (e endpoint) validationError(err error) error {
 		// 所以 `playerId: 0` 會一路走到「查不到錢包」→ 404。Go 這邊 domain 擋在前面 → 400。
 		// 非正整數的玩家 ID 不可能有錢包，「請求有問題」比「資源不存在」準確；
 		// 真實呼叫端（game-service）永遠送真的 ID。記在 CHANGELOG 與藍圖 §5。
-		return fieldError{field: "playerId", message: "must be positive"}
+		return fieldError{field: "playerId", message: apiprotocol.PlayerIDMustBePositive}
 	case errors.Is(err, domain.ErrInvalidAmount):
-		return fieldError{field: "amount", message: msgPositive}
+		return fieldError{field: "amount", message: apiprotocol.MustBePositive}
 	case errors.Is(err, domain.ErrUnknownSubType), errors.Is(err, domain.ErrSubTypeDirectionMismatch):
 		// 兩個 sentinel 併成同一個回應，因為 Java 也只有一條 @Pattern。
 		return fieldError{field: "subType", message: e.subTypeMessage}
 	case errors.Is(err, domain.ErrIdempotencyKeyRequired):
-		return fieldError{field: "idempotencyKey", message: msgNotBlank}
+		return fieldError{field: "idempotencyKey", message: apiprotocol.MustNotBeBlank}
 	case errors.Is(err, domain.ErrIdempotencyKeyTooLong):
-		return fieldError{field: "idempotencyKey", message: msgSize100}
+		return fieldError{field: "idempotencyKey", message: apiprotocol.SizeBetween(maxStringFieldLen)}
 	case errors.Is(err, domain.ErrInvalidUnfreezeAmount):
-		return fieldError{field: "unfreezeAmount", message: msgPositiveOrZero}
+		return fieldError{field: "unfreezeAmount", message: apiprotocol.MustBePositiveOrZero}
 	default:
 		// domain.ErrUnknownTxType、ErrUnfreezeNotAllowed 等從這裡走不到（NewDebit / NewCredit 硬編了方向與 unfreeze）。
 		// 真的出現代表程式有 bug 而不是請求有問題 → 原樣往上丟，落到 500。
@@ -93,17 +84,17 @@ func (e endpoint) validationError(err error) error {
 func checkCommon(playerID, amount *int64, idempotencyKey, referenceID string) error {
 	// @NotNull：null 與 0 是**兩個不同的錯誤**，這是用指標的全部理由（地雷 #33）。
 	if playerID == nil {
-		return fieldError{field: "playerId", message: msgNotNull}
+		return fieldError{field: "playerId", message: apiprotocol.MustNotBeNull}
 	}
 	if amount == nil {
-		return fieldError{field: "amount", message: msgNotNull}
+		return fieldError{field: "amount", message: apiprotocol.MustNotBeNull}
 	}
 
 	// ⚠️ @NotBlank 是 trim 之後不可為空，而 domain 只擋 ""。兩者**不是同一條規則**：
 	// 少了這一行，`"idempotencyKey": "   "` 在 Java 是 400，在 Go 會變成一把
 	// 由三個空白組成的合法冪等鍵——而且它真的會被寫進帳務流水。
 	if strings.TrimSpace(idempotencyKey) == "" {
-		return fieldError{field: "idempotencyKey", message: msgNotBlank}
+		return fieldError{field: "idempotencyKey", message: apiprotocol.MustNotBeBlank}
 	}
 	if err := checkSize("idempotencyKey", idempotencyKey); err != nil {
 		return err
@@ -121,7 +112,7 @@ func checkCommon(playerID, amount *int64, idempotencyKey, referenceID string) er
 // 這裡算 1，不值得為它改成 UTF-16 計數。）
 func checkSize(field, value string) error {
 	if utf8.RuneCountInString(value) > maxStringFieldLen {
-		return fieldError{field: field, message: msgSize100}
+		return fieldError{field: field, message: apiprotocol.SizeBetween(maxStringFieldLen)}
 	}
 	return nil
 }

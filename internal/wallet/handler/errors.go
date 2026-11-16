@@ -1,19 +1,14 @@
 package handler
 
 import (
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/apiprotocol"
+
 	"errors"
-	"fmt"
 
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/service"
-)
-
-// 對外訊息。逐字對齊 Java 的 GlobalExceptionHandler。
-const (
-	insufficientMessage     = "Insufficient balance"
-	concurrentModifyMessage = "Concurrent modification detected, please retry"
 )
 
 // respondValidationError 把驗證錯誤翻成 400。
@@ -25,7 +20,7 @@ func (h *Handler) respondValidationError(c fiber.Ctx, err error) error {
 	// 走到這裡代表 domain 多了一個 sentinel、而 validationError 沒跟上。
 	// 回 500 是刻意的失敗方向：它會被看到、會被記錄，而不是靜靜地變成看起來合理的 400。
 	h.logger.Error("驗證錯誤沒有對應的欄位訊息（domain 是不是多了一個 sentinel？）", "err", err)
-	return respondError(c, fiber.StatusInternalServerError, internalErrorMessage)
+	return respondError(c, fiber.StatusInternalServerError, apiprotocol.InternalError)
 }
 
 // respondServiceError 把 service 的結果碼翻成 Java 版的狀態碼與訊息。
@@ -39,17 +34,17 @@ func (h *Handler) respondServiceError(c fiber.Ctx, err error, m domain.Movement)
 	case service.CodeWalletNotFound:
 		// 訊息帶請求的 playerID，逐字對齊 Java：`"Wallet not found for player: " + id`。
 		return respondError(c, fiber.StatusNotFound,
-			fmt.Sprintf("Wallet not found for player: %d", m.PlayerID))
+			apiprotocol.WalletNotFound(m.PlayerID))
 	case service.CodeInsufficientBalance:
-		return respondError(c, fiber.StatusUnprocessableEntity, insufficientMessage)
+		return respondError(c, fiber.StatusUnprocessableEntity, apiprotocol.InsufficientBalance)
 	case service.CodeAidBalanceTooHigh:
-		return respondError(c, fiber.StatusUnprocessableEntity, aidBalanceTooHighMessage)
+		return respondError(c, fiber.StatusUnprocessableEntity, apiprotocol.AidBalanceTooHigh)
 	case service.CodeAidAlreadyClaimed:
-		return respondError(c, fiber.StatusUnprocessableEntity, aidAlreadyClaimedMessage)
+		return respondError(c, fiber.StatusUnprocessableEntity, apiprotocol.AidAlreadyClaimed)
 	case service.CodeConcurrentModification:
 		// 訊息是 Java 寫死的那一句（GlobalExceptionHandler:131），不是 ex.getMessage()。
-		return respondError(c, fiber.StatusConflict, concurrentModifyMessage)
+		return respondError(c, fiber.StatusConflict, apiprotocol.ConcurrentModify)
 	default:
-		return respondError(c, fiber.StatusInternalServerError, internalErrorMessage)
+		return respondError(c, fiber.StatusInternalServerError, apiprotocol.InternalError)
 	}
 }

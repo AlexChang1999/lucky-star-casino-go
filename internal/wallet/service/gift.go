@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/model/enum"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/quota"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
 )
@@ -71,7 +72,7 @@ type GiftResult struct {
 	ReceiverBalanceAfter *int64
 	// Idempotent 為 true 代表這次呼叫沒有立新單，回的是既有那張單的現況。
 	Idempotent bool
-	Status     repository.GiftStatus
+	Status     enum.GiftStatus
 }
 
 // Gift 送出一筆贈禮。key 是呼叫端的冪等鍵：帶同一把鍵重送，得到的是同一筆贈禮的現況。
@@ -151,7 +152,7 @@ func (s *Service) Gift(ctx context.Context, senderID, receiverID, amount int64, 
 		return GiftResult{}, stepErr
 	}
 	switch g.Status {
-	case repository.GiftPending:
+	case enum.GiftPending:
 		// 扣款結果不明（例如連線斷在 commit 上）。額度**不回補**：這筆贈禮可能已經扣款，
 		// 背景會用同一把鍵確認並做完它。
 		if stepErr == nil {
@@ -159,7 +160,7 @@ func (s *Service) Gift(ctx context.Context, senderID, receiverID, amount int64, 
 			stepErr = &Error{Code: CodeInternal, Err: errGiftStuck}
 		}
 		return GiftResult{}, stepErr
-	case repository.GiftRefunded:
+	case enum.GiftRefunded:
 		return GiftResult{}, &Error{Code: CodeGiftRefunded, Err: errGiftRefunded}
 	default:
 		// COMPLETED，或錢已離開送出方、入帳 / 退款還在路上（背景接手）。
@@ -207,7 +208,7 @@ func (s *Service) replayGift(g repository.GiftTransfer, senderID int64) (GiftRes
 			"idempotencyKey", g.IdempotencyKey, "ownerID", g.SenderID, "callerID", senderID)
 		return GiftResult{}, &Error{Code: CodeGiftKeyConflict, Err: errGiftKeyOwnedByOther}
 	}
-	if g.Status == repository.GiftRefunded {
+	if g.Status == enum.GiftRefunded {
 		return GiftResult{}, &Error{Code: CodeGiftRefunded, Err: errGiftRefunded}
 	}
 	return giftResultOf(g, true), nil
@@ -265,11 +266,11 @@ func (s *Service) advanceGift(ctx context.Context, g repository.GiftTransfer) (_
 			stepErr error // 這一步的錯誤；非 nil 就停
 		)
 		switch g.Status {
-		case repository.GiftPending:
+		case enum.GiftPending:
 			g, moved, deleted, stepErr = s.giftDebitStep(ctx, g, debit)
-		case repository.GiftDebited:
+		case enum.GiftDebited:
 			g, moved, stepErr = s.giftCreditStep(ctx, g, credit)
-		case repository.GiftRefunding:
+		case enum.GiftRefunding:
 			g, moved, stepErr = s.giftRefundStep(ctx, g, refund)
 		default:
 			return g, false, nil // COMPLETED / REFUNDED
@@ -332,7 +333,7 @@ func (s *Service) giftDebitStep(ctx context.Context, g repository.GiftTransfer, 
 	if !ok {
 		return g, false, false, nil
 	}
-	g.Status = repository.GiftDebited
+	g.Status = enum.GiftDebited
 	g.Attempts = 0
 	g.DebitTransactionID = &r.TransactionID
 	g.SenderBalanceAfter = &r.BalanceAfter
@@ -383,7 +384,7 @@ func (s *Service) giftCreditStep(ctx context.Context, g repository.GiftTransfer,
 		s.logger.Warn("贈禮入帳放棄，改為退款給送出方",
 			"giftID", g.ID, "senderID", g.SenderID, "receiverID", g.ReceiverID,
 			"amount", g.Amount, "attempts", attempts, "err", err)
-		g.Status = repository.GiftRefunding
+		g.Status = enum.GiftRefunding
 		g.Attempts = 0
 		return g, true, nil
 	}
@@ -397,7 +398,7 @@ func (s *Service) giftCreditStep(ctx context.Context, g repository.GiftTransfer,
 	if !ok {
 		return g, false, nil
 	}
-	g.Status = repository.GiftCompleted
+	g.Status = enum.GiftCompleted
 	g.CreditTransactionID = &r.TransactionID
 	g.ReceiverBalanceAfter = &r.BalanceAfter
 	return g, true, nil
@@ -427,7 +428,7 @@ func (s *Service) giftRefundStep(ctx context.Context, g repository.GiftTransfer,
 		return g, false, nil
 	}
 	s.logger.Info("贈禮已退回送出方", "giftID", g.ID, "senderID", g.SenderID, "amount", g.Amount)
-	g.Status = repository.GiftRefunded
+	g.Status = enum.GiftRefunded
 	g.SenderBalanceAfter = &r.BalanceAfter
 	return g, true, nil
 }

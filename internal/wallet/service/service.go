@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/model/enum"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
 )
 
@@ -52,7 +53,7 @@ type GiftRepository interface {
 	MarkGiftCompleted(ctx context.Context, id, creditTxID, receiverBalanceAfter int64) (bool, error)
 	MarkGiftRefunding(ctx context.Context, id int64, nextAttemptAt time.Time, lastErr string) (bool, error)
 	MarkGiftRefunded(ctx context.Context, id, senderBalanceAfter int64) (bool, error)
-	ScheduleGiftRetry(ctx context.Context, id int64, status repository.GiftStatus, attempts int, nextAttemptAt time.Time, lastErr string) (bool, error)
+	ScheduleGiftRetry(ctx context.Context, id int64, status enum.GiftStatus, attempts int, nextAttemptAt time.Time, lastErr string) (bool, error)
 	DueGifts(ctx context.Context, now time.Time, limit int) ([]repository.GiftTransfer, error)
 	// CreditLanded 回答「這把入帳冪等鍵的流水是否已經存在」。轉退款前用它確認入帳沒有悄悄成功。
 	CreditLanded(ctx context.Context, idempotencyKey string) (bool, error)

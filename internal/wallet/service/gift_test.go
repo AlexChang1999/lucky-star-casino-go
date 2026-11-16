@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/model/enum"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/quota"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
 )
@@ -121,7 +122,7 @@ func (w *giftWorld) InsertGift(_ context.Context, key string, sender, receiver i
 	}
 	w.nextGiftID++
 	g := &repository.GiftTransfer{ID: w.nextGiftID, IdempotencyKey: key, SenderID: sender, ReceiverID: receiver,
-		Amount: int64(amt), Status: repository.GiftPending, NextAttemptAt: &next}
+		Amount: int64(amt), Status: enum.GiftPending, NextAttemptAt: &next}
 	w.gifts[g.ID] = g
 	w.byKey[key] = g.ID
 	return *g, nil
@@ -145,7 +146,7 @@ func (w *giftWorld) GiftByID(_ context.Context, id int64) (repository.GiftTransf
 
 func (w *giftWorld) DeletePendingGift(_ context.Context, id int64) (bool, error) {
 	g, ok := w.gifts[id]
-	if !ok || g.Status != repository.GiftPending {
+	if !ok || g.Status != enum.GiftPending {
 		return false, nil
 	}
 	delete(w.byKey, g.IdempotencyKey)
@@ -155,7 +156,7 @@ func (w *giftWorld) DeletePendingGift(_ context.Context, id int64) (bool, error)
 }
 
 // transition 是條件式轉移：目前狀態不是 from 就回 false（別人先轉走了）。
-func (w *giftWorld) transition(id int64, from repository.GiftStatus, apply func(g *repository.GiftTransfer)) bool {
+func (w *giftWorld) transition(id int64, from enum.GiftStatus, apply func(g *repository.GiftTransfer)) bool {
 	g, ok := w.gifts[id]
 	if !ok || g.Status != from {
 		return false
@@ -170,32 +171,32 @@ func (w *giftWorld) MarkGiftDebited(_ context.Context, id, txID, after int64, ne
 		w.markDebitedErr = nil
 		return false, err
 	}
-	return w.transition(id, repository.GiftPending, func(g *repository.GiftTransfer) {
-		g.Status, g.Attempts, g.NextAttemptAt = repository.GiftDebited, 0, &next
+	return w.transition(id, enum.GiftPending, func(g *repository.GiftTransfer) {
+		g.Status, g.Attempts, g.NextAttemptAt = enum.GiftDebited, 0, &next
 		g.DebitTransactionID, g.SenderBalanceAfter = &txID, &after
 	}), nil
 }
 
 func (w *giftWorld) MarkGiftCompleted(_ context.Context, id, txID, after int64) (bool, error) {
-	return w.transition(id, repository.GiftDebited, func(g *repository.GiftTransfer) {
-		g.Status, g.NextAttemptAt = repository.GiftCompleted, nil
+	return w.transition(id, enum.GiftDebited, func(g *repository.GiftTransfer) {
+		g.Status, g.NextAttemptAt = enum.GiftCompleted, nil
 		g.CreditTransactionID, g.ReceiverBalanceAfter = &txID, &after
 	}), nil
 }
 
 func (w *giftWorld) MarkGiftRefunding(_ context.Context, id int64, next time.Time, _ string) (bool, error) {
-	return w.transition(id, repository.GiftDebited, func(g *repository.GiftTransfer) {
-		g.Status, g.Attempts, g.NextAttemptAt = repository.GiftRefunding, 0, &next
+	return w.transition(id, enum.GiftDebited, func(g *repository.GiftTransfer) {
+		g.Status, g.Attempts, g.NextAttemptAt = enum.GiftRefunding, 0, &next
 	}), nil
 }
 
 func (w *giftWorld) MarkGiftRefunded(_ context.Context, id, after int64) (bool, error) {
-	return w.transition(id, repository.GiftRefunding, func(g *repository.GiftTransfer) {
-		g.Status, g.NextAttemptAt, g.SenderBalanceAfter = repository.GiftRefunded, nil, &after
+	return w.transition(id, enum.GiftRefunding, func(g *repository.GiftTransfer) {
+		g.Status, g.NextAttemptAt, g.SenderBalanceAfter = enum.GiftRefunded, nil, &after
 	}), nil
 }
 
-func (w *giftWorld) ScheduleGiftRetry(_ context.Context, id int64, status repository.GiftStatus, attempts int, next time.Time, _ string) (bool, error) {
+func (w *giftWorld) ScheduleGiftRetry(_ context.Context, id int64, status enum.GiftStatus, attempts int, next time.Time, _ string) (bool, error) {
 	return w.transition(id, status, func(g *repository.GiftTransfer) {
 		g.Attempts, g.NextAttemptAt = attempts, &next
 	}), nil
@@ -205,7 +206,7 @@ func (w *giftWorld) DueGifts(_ context.Context, now time.Time, limit int) ([]rep
 	var out []repository.GiftTransfer
 	for _, g := range w.gifts {
 		switch g.Status {
-		case repository.GiftPending, repository.GiftDebited, repository.GiftRefunding:
+		case enum.GiftPending, enum.GiftDebited, enum.GiftRefunding:
 			if g.NextAttemptAt != nil && !g.NextAttemptAt.After(now) && len(out) < limit {
 				out = append(out, *g)
 			}
@@ -269,7 +270,7 @@ func TestGiftHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Gift: %v", err)
 	}
-	if r.Status != repository.GiftCompleted || r.Idempotent {
+	if r.Status != enum.GiftCompleted || r.Idempotent {
 		t.Fatalf("status=%s idempotent=%v, want COMPLETED/false", r.Status, r.Idempotent)
 	}
 	if h.balances[1] != 700 || h.balances[2] != 350 {
@@ -396,7 +397,7 @@ func TestGiftIdempotentReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-	if !again.Idempotent || again.Amount != first.Amount || again.Status != repository.GiftCompleted {
+	if !again.Idempotent || again.Amount != first.Amount || again.Status != enum.GiftCompleted {
 		t.Fatalf("replay = %+v, want 原本那筆 (amount=%d) 且 Idempotent", again, first.Amount)
 	}
 	if h.quota.giftReserved != 1 {
@@ -463,14 +464,14 @@ func TestGiftCrashBetweenDebitAndMarkNeverDoubleDebits(t *testing.T) {
 	if h.quota.giftReleased != 0 {
 		t.Error("錢已扣，額度不可回補")
 	}
-	if g, _ := h.GiftByKey(context.Background(), "k"); g.Status != repository.GiftPending {
+	if g, _ := h.GiftByKey(context.Background(), "k"); g.Status != enum.GiftPending {
 		t.Fatalf("狀態單應停在 PENDING, got %s", g.Status)
 	}
 
 	h.drain(t)
 
 	g, _ := h.GiftByKey(context.Background(), "k")
-	if g.Status != repository.GiftCompleted {
+	if g.Status != enum.GiftCompleted {
 		t.Fatalf("重試後狀態 = %s, want COMPLETED", g.Status)
 	}
 	if h.debitsRecorded != 1 || h.creditsRecorded != 1 {
@@ -495,7 +496,7 @@ func TestGiftCreditTransientFailureCompletesInBackground(t *testing.T) {
 
 	r, err := h.svc.Gift(context.Background(), 1, 2, 300, "k")
 	// 錢已離開送出方、入帳還在路上：回「處理中」而不是錯誤，背景接手。
-	if err != nil || r.Status != repository.GiftDebited {
+	if err != nil || r.Status != enum.GiftDebited {
 		t.Fatalf("got (%+v, %v), want Status=DEBITED 且 err=nil", r, err)
 	}
 	if h.balances[1] != 700 {
@@ -505,7 +506,7 @@ func TestGiftCreditTransientFailureCompletesInBackground(t *testing.T) {
 	h.drain(t)
 
 	g, _ := h.GiftByKey(context.Background(), "k")
-	if g.Status != repository.GiftCompleted || h.balances[2] != 300 || h.creditsRecorded != 1 {
+	if g.Status != enum.GiftCompleted || h.balances[2] != 300 || h.creditsRecorded != 1 {
 		t.Fatalf("status=%s receiver=%d credits=%d", g.Status, h.balances[2], h.creditsRecorded)
 	}
 }
@@ -526,7 +527,7 @@ func TestGiftCreditExhaustedRefundsSender(t *testing.T) {
 	h.drain(t)
 
 	g, _ := h.GiftByKey(context.Background(), "k")
-	if g.Status != repository.GiftRefunded {
+	if g.Status != enum.GiftRefunded {
 		t.Fatalf("status = %s, want REFUNDED", g.Status)
 	}
 	if h.balances[1] != 1000 || h.balances[2] != 0 {
@@ -628,7 +629,7 @@ func TestGiftAmbiguousCreditFailureNeverRefundsEvenWhenExhausted(t *testing.T) {
 	h.drain(t)
 
 	g, _ := h.GiftByKey(context.Background(), "k")
-	if g.Status != repository.GiftCompleted {
+	if g.Status != enum.GiftCompleted {
 		t.Fatalf("status = %s, want COMPLETED", g.Status)
 	}
 	if h.refundsRecorded != 0 || h.creditsRecorded != 1 || h.balances[1] != 700 || h.balances[2] != 300 {
@@ -674,7 +675,7 @@ func TestGiftAmbiguousFailureKeepsRetryingNeverRefunds(t *testing.T) {
 		}
 	}
 	g, _ := h.GiftByKey(context.Background(), "k")
-	if g.Status != repository.GiftDebited || h.refundsRecorded != 0 {
+	if g.Status != enum.GiftDebited || h.refundsRecorded != 0 {
 		t.Fatalf("status=%s refunds=%d, want DEBITED/0（錢卡在途中好過兩邊都拿到）", g.Status, h.refundsRecorded)
 	}
 }
@@ -698,7 +699,7 @@ func TestGiftDoesNotRefundWhenCreditAlreadyLanded(t *testing.T) {
 	if h.refundsRecorded != 0 {
 		t.Fatalf("入帳流水已存在卻退款了 %d 次", h.refundsRecorded)
 	}
-	if g, _ := h.GiftByKey(context.Background(), "k"); g.Status == repository.GiftRefunded || g.Status == repository.GiftRefunding {
+	if g, _ := h.GiftByKey(context.Background(), "k"); g.Status == enum.GiftRefunded || g.Status == enum.GiftRefunding {
 		t.Fatalf("status = %s，不該走到退款", g.Status)
 	}
 }

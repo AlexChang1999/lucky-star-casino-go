@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/model/enum"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/service"
 )
 
@@ -68,7 +68,7 @@ func TestGiftSuccessShape(t *testing.T) {
 		SenderID: 1, ReceiverID: 2, Amount: 300,
 		DebitTransactionID: i64(10), CreditTransactionID: i64(11),
 		SenderBalanceAfter: i64(700), ReceiverBalanceAfter: i64(350),
-		Status: repository.GiftCompleted,
+		Status: enum.GiftCompleted,
 	}}
 	status, body := postGift(t, svc, strp("1"), `{"receiverId":2,"amount":300,"idempotencyKey":"k1"}`)
 	if status != http.StatusOK {
@@ -91,7 +91,7 @@ func TestGiftInFlightHasNullFields(t *testing.T) {
 	svc := &giftSvc{result: service.GiftResult{
 		SenderID: 1, ReceiverID: 2, Amount: 300,
 		DebitTransactionID: i64(10), SenderBalanceAfter: i64(700),
-		Status: repository.GiftDebited,
+		Status: enum.GiftDebited,
 	}}
 	_, body := postGift(t, svc, strp("1"), `{"receiverId":2,"amount":300,"idempotencyKey":"k1"}`)
 	if !strings.Contains(body, `"creditTransactionId":null`) || !strings.Contains(body, `"receiverBalanceAfter":null`) {

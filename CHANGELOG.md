@@ -5,6 +5,26 @@
 
 ---
 
+## [refactor] — 2026-11-16 — wallet 分層命名：repository、model/{dto,enum}、apiprotocol
+
+只改命名與位置，**沒有行為變更**。決策與沒照 skill 做的地方見 `docs/ADR-006`。
+
+**Changed**
+
+- `internal/wallet/store` → `internal/wallet/repository`；`service.Store` / `GiftStore` →
+  `Repository` / `GiftRepository`，欄位 `store` → `repo`。
+- 請求/回應型別搬進 `model/dto/input`（`DebitReq` / `CreditReq` / `GiftReq`）與
+  `model/dto/output`（`DebitRes` / `CreditRes` / `GiftRes` / `BankruptcyAidRes`）；dto 不帶方法，
+  轉換與驗證留在 handler。
+- `GiftStatus` 搬進 `model/enum`。
+- 信封與對外訊息搬進 `apiprotocol`（`Body`、`OK`、`Fail`、訊息常數與函式）。
+
+**如何驗證**：`go vet`（含 `-tags=infra`）、`go test -race -count=1 ./...`、`golangci-lint run`；
+`go test -race -tags=infra ./internal/wallet/repository/ ./internal/wallet/outbox/`（真實 MySQL 8.4）。
+這次一併補跑了上一個切片之後沒再跑過的 `CreditLanded` infra 測試。
+
+---
+
 ## [feat] — 2026-11-16 — `POST /api/v1/wallet/gift`：贈禮改為狀態單 + 補償
 
 贈禮是「送出方 debit」加「接收方 credit」兩筆獨立交易，中間隔一張狀態單 `gift_transfers`
