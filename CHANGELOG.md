@@ -5,6 +5,36 @@
 
 ---
 
+## [feat] — 2026-11-16 — `POST /api/v1/wallet/gift`：贈禮改為狀態單 + 補償
+
+贈禮是「送出方 debit」加「接收方 credit」兩筆獨立交易，中間隔一張狀態單 `gift_transfers`
+（先立單、後動錢）。決策、狀態機與取捨見 `docs/ADR-005`。
+
+**Added**
+
+- migration `00003_gift_transfers.sql`（`idempotency_key` / `status` 用 `utf8mb4_bin`，三條 CHECK）；
+  `VerifyWalletSchema` 多驗這張表。⚠️ 舊環境要先 `go run ./cmd/migrate up`，否則開機自檢擋下。
+- `store`：狀態單的存取（條件式轉移，回傳是否真的轉到）。
+- `service.Gift` / `RetryDueGifts` / `RunGiftRetries`；七個新 Code。
+- `handler.Gift`：欄位與訊息對齊 Java `GiftRequest`（`@NotNull`/`@Positive`/`@NotBlank`/`@Size(max=80)`）。
+- `cmd/wallet`：起背景重試 goroutine，納入「由外往內」的收工順序。`service.New` 多一個 `GiftStore` 參數。
+
+**審查修正**：`go-reviewer` 抓到「入帳第 5 次遇到結果不明的錯誤就轉退款」會讓兩邊都拿到錢。
+現在結果不明（`CodeInternal`）不算次數用盡、無限用同一把鍵重試；確定沒入帳的失敗用盡次數後，
+轉退款前還會用 `CreditLanded` 查入帳流水。兩道防線各有單獨的測試，且都做過破壞驗證（各拿掉一道會紅）。
+殘留的競態視窗見 ADR-005「已知限制」。
+
+**刻意的差異**：冪等重送只回給原送出方（他人 409）；新增「已退款」409；請求回傳時可能是處理中
+（四個欄位為 `null`）。理由與代價見 ADR-005。⚠️ 以上都尚未對 Java 版驗證。
+
+**如何驗證**：`go vet`（含 `-tags=infra`）、`go test -race ./internal/wallet/...`、
+`go test -race -tags=infra ./internal/wallet/store/`（對 MySQL 8.4，含新 migration）。
+手動：對真實 MySQL/Redis 跑起 `cmd/wallet`，成功（兩筆 `GIFT` 流水、狀態單 COMPLETED）、同鍵重送
+`idempotent:true`、他人用同鍵 409、送給自己 400、接收方不存在 404、超額 422 皆符合預期。
+⚠️ **未做**：入帳失敗 → 退款的端到端（只有單元測試）、多副本併發重試、對 Java 版的契約測試。
+
+---
+
 ## [feat] — 2026-11-16 — `POST /api/v1/wallet/bankruptcy-aid`：額度層第一次被接上
 
 Redis 額度層（`internal/wallet/quota`）做完之後一直沒有消費者，這是第一個。流程逐步對齊 Java

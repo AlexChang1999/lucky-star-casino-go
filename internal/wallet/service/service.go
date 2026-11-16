@@ -34,6 +34,28 @@ type Store interface {
 type Quota interface {
 	ClaimBankruptcyAidAt(ctx context.Context, playerID int64, now time.Time) error
 	ReleaseBankruptcyAid(ctx context.Context, playerID int64)
+	// ReserveGiftQuota 超限時回 quota.ErrGiftSentLimitExceeded / ErrGiftRecvLimitExceeded（已回補完畢）。
+	ReserveGiftQuota(ctx context.Context, senderID, receiverID int64, amount domain.Amount) error
+	ReleaseGiftQuota(ctx context.Context, senderID, receiverID int64, amount domain.Amount)
+}
+
+// GiftStore 是贈禮狀態單的存取能力，定義在消費端（CLAUDE.md §2）。
+// 與 Store 分開，是因為只有贈禮用得到它——debit / credit 的測試替身不必跟著長出十個方法。
+//
+// 回傳 bool 的方法都是條件式轉移：false 代表「別人已經先轉走了」，不是錯誤。
+type GiftStore interface {
+	InsertGift(ctx context.Context, key string, senderID, receiverID int64, amount domain.Amount, nextAttemptAt time.Time) (walletstore.GiftTransfer, error)
+	GiftByKey(ctx context.Context, key string) (walletstore.GiftTransfer, error)
+	GiftByID(ctx context.Context, id int64) (walletstore.GiftTransfer, error)
+	DeletePendingGift(ctx context.Context, id int64) (bool, error)
+	MarkGiftDebited(ctx context.Context, id, debitTxID, senderBalanceAfter int64, nextAttemptAt time.Time) (bool, error)
+	MarkGiftCompleted(ctx context.Context, id, creditTxID, receiverBalanceAfter int64) (bool, error)
+	MarkGiftRefunding(ctx context.Context, id int64, nextAttemptAt time.Time, lastErr string) (bool, error)
+	MarkGiftRefunded(ctx context.Context, id, senderBalanceAfter int64) (bool, error)
+	ScheduleGiftRetry(ctx context.Context, id int64, status walletstore.GiftStatus, attempts int, nextAttemptAt time.Time, lastErr string) (bool, error)
+	DueGifts(ctx context.Context, now time.Time, limit int) ([]walletstore.GiftTransfer, error)
+	// CreditLanded 回答「這把入帳冪等鍵的流水是否已經存在」。轉退款前用它確認入帳沒有悄悄成功。
+	CreditLanded(ctx context.Context, idempotencyKey string) (bool, error)
 }
 
 // Service 是 wallet 的應用服務。
@@ -43,6 +65,7 @@ type Quota interface {
 // （CLAUDE.md §2、docs/ADR-004）。
 type Service struct {
 	store  Store
+	gifts  GiftStore
 	quota  Quota
 	logger *slog.Logger
 
@@ -51,9 +74,9 @@ type Service struct {
 }
 
 // New 組出 Service。logger 為 nil 時退回 slog.Default()。
-func New(store Store, quota Quota, logger *slog.Logger) *Service {
+func New(store Store, gifts GiftStore, quota Quota, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{store: store, quota: quota, logger: logger, now: time.Now}
+	return &Service{store: store, gifts: gifts, quota: quota, logger: logger, now: time.Now}
 }

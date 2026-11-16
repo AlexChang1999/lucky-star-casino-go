@@ -38,7 +38,7 @@ func (f *fakeStore) Credit(_ context.Context, m domain.Movement) (walletstore.Cr
 }
 
 func newTestService(st Store) *Service {
-	return New(st, &fakeQuota{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(st, nil, &fakeQuota{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 // TestDebitClassifiesStoreErrors 釘住 sentinel → Code 的分類。
