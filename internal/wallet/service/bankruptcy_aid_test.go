@@ -20,12 +20,25 @@ type fakeQuota struct {
 	claimedAt  time.Time
 	released   int
 	releasedID int64
+
+	giftErr      error
+	giftReserved int
+	giftReleased int
 }
 
 func (f *fakeQuota) ClaimBankruptcyAidAt(_ context.Context, _ int64, now time.Time) error {
 	f.claimed++
 	f.claimedAt = now
 	return f.claimErr
+}
+
+func (f *fakeQuota) ReserveGiftQuota(context.Context, int64, int64, domain.Amount) error {
+	f.giftReserved++
+	return f.giftErr
+}
+
+func (f *fakeQuota) ReleaseGiftQuota(context.Context, int64, int64, domain.Amount) {
+	f.giftReleased++
 }
 
 func (f *fakeQuota) ReleaseBankruptcyAid(_ context.Context, playerID int64) {
@@ -37,7 +50,7 @@ func (f *fakeQuota) ReleaseBankruptcyAid(_ context.Context, playerID int64) {
 // 2026-11-16T17:00:00Z = 台北 2026-11-17 01:00——UTC 與台北的「今天」刻意不同天，
 // 日界用錯時區的話冪等鍵的日期會對不上。
 func aidService(st *fakeStore, q *fakeQuota) *Service {
-	s := New(st, q, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := New(st, nil, q, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.now = func() time.Time { return time.Date(2026, 11, 16, 17, 0, 0, 0, time.UTC) }
 	return s
 }

@@ -16,6 +16,17 @@ const (
 	// 所以拆成兩個 Code，不合併成一個 CodeNotEligible。
 	CodeAidBalanceTooHigh
 	CodeAidAlreadyClaimed
+	// 贈禮。sender / receiver 的「錢包不存在」拆成兩個 Code，因為對外訊息要指明是哪一方；
+	// 兩種超額也各有一句訊息（理由同上面的破產救助）。
+	CodeInvalidGift
+	CodeGiftSentLimitExceeded
+	CodeGiftRecvLimitExceeded
+	CodeGiftSenderNotFound
+	CodeGiftReceiverNotFound
+	// CodeGiftRefunded：入帳重試用盡，錢已退回送出方。對送禮的人來說這是一次失敗的贈禮。
+	CodeGiftRefunded
+	// CodeGiftKeyConflict：這把冪等鍵屬於另一位送出方的贈禮。
+	CodeGiftKeyConflict
 )
 
 // Error 是 service 層對外的唯一錯誤型別。

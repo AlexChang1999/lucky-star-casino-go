@@ -28,10 +28,11 @@ const binCollation = "utf8mb4_bin"
 var requiredBinCollation = map[string][]string{
 	"wallet_transactions": {"idempotency_key", "type", "sub_type"},
 	"wallet_outbox":       {"status"},
+	"gift_transfers":      {"idempotency_key", "status"},
 }
 
-// requiredTables 是 wallet 開機必須存在的四張表。
-var requiredTables = []string{"wallets", "wallet_transactions", "wallet_outbox", "diamond_wallets"}
+// requiredTables 是 wallet 開機必須存在的五張表。
+var requiredTables = []string{"wallets", "wallet_transactions", "wallet_outbox", "diamond_wallets", "gift_transfers"}
 
 // requiredChecks 是必須存在的 CHECK 約束。
 //
@@ -45,6 +46,9 @@ var requiredChecks = []string{
 	"chk_wt_amount", // amount > 0，防負數扣款變相入帳
 	"chk_wallet_outbox_status",
 	"chk_diamond_wallets_balance",
+	"chk_gift_transfers_amount",
+	"chk_gift_transfers_parties", // sender <> receiver，防自己送自己刷額度
+	"chk_gift_transfers_status",
 }
 
 // VerifyWalletSchema 在服務啟動時確認 schema 已正確套用。

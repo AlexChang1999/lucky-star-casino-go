@@ -40,6 +40,7 @@ func NewApp(h *Handler, internalSecret string, cfg config.HTTPServer) (*fiber.Ap
 	app.Post("/internal/wallet/debit", h.Debit)
 	app.Post("/internal/wallet/credit", h.Credit)
 	app.Post("/api/v1/wallet/bankruptcy-aid", h.BankruptcyAid)
+	app.Post("/api/v1/wallet/gift", h.Gift)
 
 	return app, nil
 }

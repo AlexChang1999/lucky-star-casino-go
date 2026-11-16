@@ -142,7 +142,7 @@ func run() error {
 		return err
 	}
 
-	walletSvc := service.New(repo, quotaStore, logger)
+	walletSvc := service.New(repo, repo, quotaStore, logger)
 	walletHandler, err := handler.New(walletSvc, logger)
 	if err != nil {
 		return err
@@ -174,7 +174,7 @@ func run() error {
 	memberConsumer := kafka.NewConsumer(memberReader, "wallet-member-registered", memberHandler.Handle, logger)
 
 	// ⚠️ 收工順序是**由外往內**，而且不能靠 defer 的 LIFO 去湊：
-	//   ① serve 返回（ctx 已取消）→ ② 等三個背景 goroutine 跑完當前這一輪
+	//   ① serve 返回（ctx 已取消）→ ② 等四個背景 goroutine 跑完當前這一輪
 	//   → ③ 關 member consumer 與它的 DLT writer → ④ 關 outbox Kafka writer
 	//   → ⑤ 關 MySQL（上面那個 defer，LIFO 排在最後）
 	// 順序反了的症狀都很難查：先關 writer，最後一輪會把已寫入 DB 的事件
@@ -183,7 +183,7 @@ func run() error {
 	// Kafka 邏輯上獨立，但兩者都是「先停背景 goroutine、才收尾巴的 Kafka
 	// 資源」，跟著同一個外往內的次序走，比另外發明一套順序更好記。
 	var background sync.WaitGroup
-	background.Add(3)
+	background.Add(4)
 	go func() {
 		defer background.Done()
 		poller.Run(ctx)
@@ -191,6 +191,11 @@ func run() error {
 	go func() {
 		defer background.Done()
 		purger.Run(ctx)
+	}()
+	// 贈禮狀態單的背景重試：請求中斷或入帳失敗的贈禮靠它做完或退款（docs/ADR-005）。
+	go func() {
+		defer background.Done()
+		walletSvc.RunGiftRetries(ctx)
 	}()
 	go func() {
 		defer background.Done()

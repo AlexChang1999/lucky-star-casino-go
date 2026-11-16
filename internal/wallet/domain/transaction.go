@@ -161,6 +161,23 @@ func NewCredit(playerID int64, amount Amount, subType SubType, idempotencyKey, r
 	return newMovement(playerID, TxTypeCredit, subType, amount, unfreeze, idempotencyKey, referenceID)
 }
 
+// NewGiftDebit 建立贈禮「送出方」的扣款意圖：type=DEBIT、sub_type=GIFT。
+//
+// ⚠️ 這是 subTypeDirection 那張表**唯一**的例外，而且只能從這個建構子走：
+// Java 的 `GiftTransferService` 直接寫 `DEBIT/GIFT` 分錄（繞過 DebitRequest 的 @Pattern），
+// 所以 GIFT 在帳上是雙向的；但對外的 `/internal/wallet/debit` 仍然只收 BET / SHOP_PURCHASE。
+// 把例外放進 subTypeDirection 會讓那個端點也開始收 GIFT——那是對外契約漂移。
+//
+// 其餘驗證（playerID、金額、冪等鍵）沿用 newMovement：先以 BET 通過方向檢查，再換成 GIFT。
+func NewGiftDebit(senderID int64, amount Amount, idempotencyKey, referenceID string) (Movement, error) {
+	m, err := newMovement(senderID, TxTypeDebit, SubTypeBet, amount, 0, idempotencyKey, referenceID)
+	if err != nil {
+		return Movement{}, err
+	}
+	m.SubType = SubTypeGift
+	return m, nil
+}
+
 func newMovement(playerID int64, txType TxType, subType SubType, amount, unfreeze Amount, idempotencyKey, referenceID string) (Movement, error) {
 	if playerID <= 0 {
 		return Movement{}, fmt.Errorf("%w: 得到 %d", ErrPlayerIDRequired, playerID)
