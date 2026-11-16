@@ -443,6 +443,19 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     本專案寫的是 `purgeHourUTC = 20`，由 `TestPurgeHourIsOffPeakInTaipei` 釘住。
     判準更廣：**從 Java 版搬任何排程時間過來，先問「原本那個數字是哪個時區的」**。
 
+40. **`member.registered.DLT` 有人發、沒人收（Java 與 Go 都一樣）**：Java 的
+    `DeadLetterListener` 對 `wallet.credit.DLT` / `wallet.debit.DLT` /
+    `wallet.credit.request.DLT` 都有對應的 listener，唯獨少了
+    `member.registered.DLT`——`MemberEventListener` 重試 3 次失敗後把訊息送進
+    這個 topic，然後就沒有任何東西再讀它。Go 版 `internal/wallet/memberconsume`
+    **刻意照抄這個行為**，不是漏做：這個切片的範圍是「消費
+    `member.registered` 建錢包」，蓋一個誰都不查的 DLT reader 是過度設計。
+    ⚠️ 後果是：任何格式錯誤或持續性 DB 故障導致的建錢包失敗，訊息進了 DLT
+    之後**沒有任何告警、沒有任何人工介入路徑**——玩家會有一個永遠沒有錢包的
+    帳號，而且**沒有錯誤訊息**指向這件事（HTTP 呼叫端目前也沒有任何查詢
+    錢包的端點會回報 404，因為契約測試都是直接種資料庫）。要補的話是一支
+    獨立的告警/查詢工具，不在這個切片範圍內。
+
 ---
 
 ## 3. 約定速查

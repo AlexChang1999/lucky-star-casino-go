@@ -211,6 +211,48 @@ func NewRepository(db *gorm.DB, logger *slog.Logger) *Repository {
 	return &Repository{db: db, logger: logger}
 }
 
+const (
+	insertWallet        = `INSERT INTO wallets (player_id, balance, frozen_amount, version) VALUES (?, 0, 0, 0)`
+	insertDiamondWallet = `INSERT INTO diamond_wallets (player_id, balance, version) VALUES (?, 0, 0)`
+)
+
+// CreateWallet 建立一個餘額 0 的星幣錢包，由 member.registered 消費端呼叫
+// （internal/wallet/memberconsume）。對齊 Java 的 WalletService.createWallet。
+//
+// ⚠️ 這裡**不做 `SELECT exists` 預檢**——Java 版是 existsById 預檢 + catch
+// DataIntegrityViolationException 兩層防護，因為 existsById 跟後面的 INSERT
+// 中間有 race，得靠 catch 兜底。Go 版直接靠 player_id 的 PRIMARY KEY 衝突
+// 一次到位，對齊 AGENTS.md 地雷 #26 的既定教條（冪等鍵走 UNIQUE 索引衝突，
+// 不是先查後寫）。少一次往返，也少一個「兩層防護其實只有一層在起作用」的疑惑。
+//
+// ⚠️ 不需要 `sql.TxOptions{Isolation: ReadCommitted}`：這是單列 INSERT，沒有
+// NOT EXISTS 子查詢也沒有範圍掃描，不會觸發地雷 #34/#37 的 gap lock 死鎖
+// 機制（那兩條地雷都是「搜尋不存在的鍵」才會下 gap lock）。預設
+// REPEATABLE READ 在這裡沒有問題。
+func (r *Repository) CreateWallet(ctx context.Context, playerID int64) error {
+	err := r.db.WithContext(ctx).Exec(insertWallet, playerID).Error
+	if isDupEntry(err) {
+		r.logger.Warn("star-coin 錢包已存在，冪等 no-op", "playerID", playerID)
+		return nil
+	}
+	return err
+}
+
+// CreateDiamondWallet 建立一個餘額 0 的鑽石錢包，與 CreateWallet 平行、由同一個
+// member.registered 事件觸發。對齊 Java 的 DiamondWalletService.createDiamondWallet。
+//
+// 兩個 Create 呼叫**不包在同一筆交易裡**——對齊 Java（createWallet 與
+// createDiamondWallet 本來就是兩個獨立的 saveAndFlush）。各自冪等，其中一個
+// 失敗不影響另一個的狀態，訊息重送時會自然補完沒做完的那一個。
+func (r *Repository) CreateDiamondWallet(ctx context.Context, playerID int64) error {
+	err := r.db.WithContext(ctx).Exec(insertDiamondWallet, playerID).Error
+	if isDupEntry(err) {
+		r.logger.Warn("鑽石錢包已存在，冪等 no-op", "playerID", playerID)
+		return nil
+	}
+	return err
+}
+
 // DebitResult 是一次扣款的結果，對齊 Java 的 DebitResponse。
 //
 // Idempotent 為 true 代表**這次呼叫沒有真的扣款**，回的是原交易的值——
