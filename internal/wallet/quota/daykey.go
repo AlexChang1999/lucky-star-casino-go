@@ -83,6 +83,10 @@ func dayStamp(t time.Time) string {
 	return t.In(dayZone).Format(time.DateOnly)
 }
 
+// DayStamp 是 dayStamp 的匯出版，給需要「與額度 key 同一個日期」的呼叫端
+// （破產救助的入帳冪等鍵）。不要在別處重寫一份——日界只能有一個定義。
+func DayStamp(t time.Time) string { return dayStamp(t) }
+
 // untilNextMidnight 回傳從 t 到台北下一個午夜的時距，也就是當日 key 的 TTL。
 //
 // ⭐ **為什麼是相對時距（TTL）而不是絕對時刻（EXPIREAT / PXAT）**：

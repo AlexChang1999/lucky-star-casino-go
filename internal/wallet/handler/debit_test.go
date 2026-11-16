@@ -23,6 +23,11 @@ type fakeService struct {
 	creditResult service.CreditResult
 	creditErr    error
 
+	aidResult service.BankruptcyAidResult
+	aidErr    error
+	aidCalls  int
+	aidPlayer int64
+
 	calls    int
 	received domain.Movement
 }
@@ -37,6 +42,12 @@ func (f *fakeService) Credit(_ context.Context, m domain.Movement) (service.Cred
 	f.calls++
 	f.received = m
 	return f.creditResult, f.creditErr
+}
+
+func (f *fakeService) BankruptcyAid(_ context.Context, playerID int64) (service.BankruptcyAidResult, error) {
+	f.aidCalls++
+	f.aidPlayer = playerID
+	return f.aidResult, f.aidErr
 }
 
 var goodSecret = testSecret

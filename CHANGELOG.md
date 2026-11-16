@@ -5,6 +5,35 @@
 
 ---
 
+## [feat] — 2026-11-16 — `POST /api/v1/wallet/bankruptcy-aid`：額度層第一次被接上
+
+Redis 額度層（`internal/wallet/quota`）做完之後一直沒有消費者，這是第一個。流程逐步對齊 Java
+`BankruptcyAidService.claim`：總餘額 < 100 → 搶當日鎖 → credit 1000（冪等鍵
+`bankruptcy-aid:{id}:{台北日期}`）→ 入帳失敗釋放鎖、冪等命中保留鎖並視為已領過。
+
+**Added**
+
+- `store.Repository.Balance`（總餘額，不是可用餘額；錢包不存在 → `ErrWalletNotFound`）。
+- `service.BankruptcyAid`、兩個新 Code（`CodeAidBalanceTooHigh` / `CodeAidAlreadyClaimed`，兩句 422 訊息不同）。
+- `handler.BankruptcyAid`：`X-User-Id` 缺 → 400 `Missing X-User-Id header`、非整數 → 400 `Invalid X-User-Id header`。
+- `quota.ClaimBankruptcyAidAt` / `quota.DayStamp`：鎖的日期與冪等鍵的日期必須來自**同一個時刻**
+  （各自讀時鐘，午夜前後會落在不同兩天，DB 那道第二防線就失效；Java 是只呼叫一次 `now()`）。
+- `cmd/wallet` 組裝 Redis client 與 quota；`service.New` 多一個 `Quota` 參數。
+
+**刻意的差異（決策：選項 1）**
+
+- 玩家路由 `/api/v1/**` 也要 `X-Internal-Secret`。Java 的 `/api/v1/**` 不驗，靠 gateway；gateway 還不存在，
+  不加的話任何人都能用 `X-User-Id` 冒充玩家。gateway 上線後再重新評估。
+- Redis 啟動時不 Ping（debit/credit 用不到它）；Redis 掛了只有這支端點回 500（fail-closed，與 Java 一致）。
+
+**如何驗證**：`go vet`（含 `-tags=infra`）、`go test -race -count=1 -tags=infra ./...`、`golangci-lint` 全過；
+破壞驗證（門檻 `>=` 改 `>`）使 `TestBankruptcyAidEligibility` 轉紅。手動：對真實 MySQL/Redis 跑起
+`cmd/wallet`，餘額 50 領到 1000（流水冪等鍵為台北日期、sub_type `BANKRUPTCY_AID`）、再領回 422、
+無 secret 回 401、不存在的玩家回 404。⚠️ **未做**：對 Java 版的契約測試（尚未起 Java 版）；
+「今天已領過」與「Redis 掛了」兩條路徑只有單元測試，沒有端到端跑過。
+
+---
+
 ## [refactor] — 2026-11-15 — wallet HTTP 層 Gin → Fiber v3，並拆成 handler / service / store 三層
 
 三支端點（`GET /healthz`、`POST /internal/wallet/debit`、`POST /internal/wallet/credit`）

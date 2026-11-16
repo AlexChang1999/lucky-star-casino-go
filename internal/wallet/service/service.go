@@ -14,6 +14,7 @@ package service
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
 	walletstore "github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
@@ -24,6 +25,15 @@ import (
 type Store interface {
 	Debit(ctx context.Context, m domain.Movement) (walletstore.DebitResult, error)
 	Credit(ctx context.Context, m domain.Movement) (walletstore.CreditResult, error)
+	// Balance 回傳**總餘額**（不是可用餘額），錢包不存在回 walletstore.ErrWalletNotFound。
+	Balance(ctx context.Context, playerID int64) (int64, error)
+}
+
+// Quota 是這一層需要的 Redis 額度能力，定義在消費端（CLAUDE.md §2）。
+// *quota.Store 不知道這個介面存在。
+type Quota interface {
+	ClaimBankruptcyAidAt(ctx context.Context, playerID int64, now time.Time) error
+	ReleaseBankruptcyAid(ctx context.Context, playerID int64)
 }
 
 // Service 是 wallet 的應用服務。
@@ -33,13 +43,17 @@ type Store interface {
 // （CLAUDE.md §2、docs/ADR-004）。
 type Service struct {
 	store  Store
+	quota  Quota
 	logger *slog.Logger
+
+	// now 讓測試能把「現在」釘在台北與 UTC 不同天的位置。正式路徑一律 time.Now。
+	now func() time.Time
 }
 
 // New 組出 Service。logger 為 nil 時退回 slog.Default()。
-func New(store Store, logger *slog.Logger) *Service {
+func New(store Store, quota Quota, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{store: store, logger: logger}
+	return &Service{store: store, quota: quota, logger: logger, now: time.Now}
 }

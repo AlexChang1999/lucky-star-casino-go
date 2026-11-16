@@ -12,6 +12,10 @@ const (
 	CodeWalletNotFound
 	CodeInsufficientBalance
 	CodeConcurrentModification
+	// 破產救助的兩種「不符資格」對外都是 422，但訊息不同（Java 兩句不同的文字），
+	// 所以拆成兩個 Code，不合併成一個 CodeNotEligible。
+	CodeAidBalanceTooHigh
+	CodeAidAlreadyClaimed
 )
 
 // Error 是 service 層對外的唯一錯誤型別。
