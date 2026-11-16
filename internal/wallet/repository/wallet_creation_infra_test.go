@@ -3,8 +3,8 @@
 // 需要真的跑起來的 MySQL：
 //
 //	docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env up -d --wait
-//	go test -race -tags=infra ./internal/wallet/store/
-package store
+//	go test -race -tags=infra ./internal/wallet/repository/
+package repository
 
 import (
 	"sync"

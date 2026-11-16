@@ -20,7 +20,7 @@ import (
 	"github.com/segmentio/kafka-go"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/config"
-	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
 )
 
 // newScratchTopic 建一個用完就刪的單 partition topic。
@@ -78,7 +78,7 @@ func TestPublisherRoundTrip(t *testing.T) {
 	})
 
 	// payload 刻意用 domain 產生的那個形狀（欄位順序與 Java 的 record 一致）。
-	events := []store.PendingEvent{
+	events := []repository.PendingEvent{
 		{ID: 1, Topic: topic, KafkaKey: ptr("42"), Payload: `{"transactionId":1,"playerId":42,"amount":300,"referenceId":null}`},
 		{ID: 2, Topic: topic, KafkaKey: ptr("42"), Payload: `{"transactionId":2,"playerId":42,"amount":100,"referenceId":"round-9527"}`},
 	}
@@ -137,7 +137,7 @@ func TestPublisherDoesNotWaitForBatchTimeout(t *testing.T) {
 	publisher := NewPublisher(NewWriter(brokers, 500, discardLogger()), discardLogger())
 	t.Cleanup(func() { _ = publisher.Close() })
 
-	one := []store.PendingEvent{{ID: 1, Topic: topic, KafkaKey: ptr("42"), Payload: `{"n":1}`}}
+	one := []repository.PendingEvent{{ID: 1, Topic: topic, KafkaKey: ptr("42"), Payload: `{"n":1}`}}
 
 	// 第一次順便暖機：建連線、拿 metadata，那些成本不屬於 BatchTimeout。
 	if _, err := publisher.Publish(ctx, one); err != nil {
@@ -145,7 +145,7 @@ func TestPublisherDoesNotWaitForBatchTimeout(t *testing.T) {
 	}
 
 	start := time.Now()
-	if _, err := publisher.Publish(ctx, []store.PendingEvent{{ID: 2, Topic: topic, KafkaKey: ptr("42"), Payload: `{"n":2}`}}); err != nil {
+	if _, err := publisher.Publish(ctx, []repository.PendingEvent{{ID: 2, Topic: topic, KafkaKey: ptr("42"), Payload: `{"n":2}`}}); err != nil {
 		t.Fatalf("投遞失敗: %v", err)
 	}
 	elapsed := time.Since(start)

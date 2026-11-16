@@ -3,13 +3,13 @@
 // 需要真的跑起來的 MySQL：
 //
 //	docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env up -d --wait
-//	go test -race -tags=infra ./internal/wallet/store/
+//	go test -race -tags=infra ./internal/wallet/repository/
 //
 // ⚠️ 這一檔的每個測試都在**自己的臨時資料庫**上跑（mysqltest.NewScratchDB），
 // 不像 schema_infra_test.go 共用開發庫。理由有兩個：
 //   - 併發測試要斷言「總共只有 N 筆流水」，共用的庫裡有別人的資料就驗不了
 //   - 從空庫開始才驗得到 migration 真的建得出可用的 schema
-package store
+package repository
 
 import (
 	"bytes"

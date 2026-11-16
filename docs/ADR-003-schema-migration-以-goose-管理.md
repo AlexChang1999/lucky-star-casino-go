@@ -29,7 +29,7 @@
 `ADR-002` 的「待辦」把補上 migration 工具列為 **Phase A 結束前必做**，
 本檔就是那件事。
 
-`internal/wallet/store.VerifyWalletSchema` 是當時的緩解措施——它讓「忘了套用」
+`internal/wallet/repository.VerifyWalletSchema` 是當時的緩解措施——它讓「忘了套用」
 在**開機時**失敗而不是等到第一筆下注。但它是**緩解不是解法**：
 它只認得一份硬編碼的檢查清單，未來每加一個欄位都要有人記得回來改它。
 
@@ -115,7 +115,7 @@ if err := migrate.VerifyVersion(ctx, sqlDB); err != nil {
 
 ⚠️ 代價是它**看不出定義漂移**：表存在但欄位不同時它靜靜跳過。
 這正是決策 4 裡 `VerifyWalletSchema` 存在的理由——而且為了讓那個保護真的
-有效，`internal/wallet/store` 有一個測試在**空的臨時資料庫**上跑完 migration
+有效，`internal/wallet/repository` 有一個測試在**空的臨時資料庫**上跑完 migration
 之後才做自檢（`TestMigrationProducesVerifiableSchema`）。
 在已經有表的開發庫上驗，`IF NOT EXISTS` 會讓測試綠得毫無意義。
 

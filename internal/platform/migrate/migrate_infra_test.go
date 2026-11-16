@@ -7,7 +7,7 @@
 //	go test -race -tags=infra ./internal/platform/migrate/
 //
 // ⚠️ 這裡驗的是 **migration 機制**（套用、冪等、回退、版本守門），
-// 不是「schema 長得對不對」——後者是 internal/wallet/store.VerifyWalletSchema
+// 不是「schema 長得對不對」——後者是 internal/wallet/repository.VerifyWalletSchema
 // 的職責，而且那邊有一個測試會把兩者接起來（migration 的產出必須通過帳務自檢）。
 // 兩邊各驗各的，不要在這裡複製一份欄位清單，那會變成第二份會漂移的真相。
 package migrate

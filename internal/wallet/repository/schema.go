@@ -1,8 +1,8 @@
-// Package store 是 wallet 的 MySQL 存取層。
+// Package repository 是 wallet 的 MySQL 存取層。
 //
 // schema.go 是開機自檢，repository.go 是帳務語句本體（docs/ADR-002）。
 // credit 的實作接在後面。
-package store
+package repository
 
 import (
 	"context"

@@ -3,7 +3,7 @@
 // 需要真的跑起來的 MySQL：
 //
 //	docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env up -d --wait
-//	go test -race -tags=infra ./internal/wallet/store/
+//	go test -race -tags=infra ./internal/wallet/repository/
 //
 // 這裡面的測試分兩類，混在一起是刻意的：
 //   - 「我們的 schema 對不對」——VerifyWalletSchema
@@ -12,7 +12,7 @@
 // 第二類看起來像在測資料庫而不是測自己的程式，但它們正是 docs/ADR-002
 // 的立論基礎。與其在 ADR 裡宣稱「MySQL 會這樣」，不如讓測試釘住它：
 // 哪天升版行為變了，這裡會紅，而不是帳先錯。
-package store
+package repository
 
 import (
 	"context"

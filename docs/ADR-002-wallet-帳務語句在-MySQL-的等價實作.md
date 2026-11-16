@@ -250,7 +250,7 @@ MySQL 少了這層保護，逐行照抄的結果是**餘額加了、流水沒寫
 
 ## 這些主張怎麼被證明
 
-不靠文件宣稱，靠測試釘住。`internal/wallet/store/schema_infra_test.go`
+不靠文件宣稱，靠測試釘住。`internal/wallet/repository/schema_infra_test.go`
 （`-tags=infra`，連真的 MySQL）逐條驗證：
 
 | 測試 | 釘住的主張 |

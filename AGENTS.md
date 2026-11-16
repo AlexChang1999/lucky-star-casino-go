@@ -248,7 +248,7 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     （coercibility 2）優先於字面值的連線定序（coercibility 4）。
     設了連線定序不代表你安全了。
     已於 2026-08-01 對 MySQL 8.4.10 實測驗證兩個方向，並由
-    `internal/wallet/store/schema_infra_test.go` 釘住。
+    `internal/wallet/repository/schema_infra_test.go` 釘住。
 
 31. **⭐ MySQL 沒有交易式 DDL，所以 migration 失敗會留下半套 schema**：
     PostgreSQL 的 DDL 可以放進交易裡回滾，團隊 Java 版因此從來不必想這件事。
@@ -286,7 +286,7 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     ⚠️ 判準：**「先讀過東西、再依賴別人剛提交的結果」的交易一律要當心。**
     冷路徑（條件 UPDATE 是交易的第一條語句）不受影響——造成 NOT EXISTS
     不成立的那一列必定在 UPDATE 之前就已提交。
-    由 `internal/wallet/store/repository_infra_test.go` 的
+    由 `internal/wallet/repository/repository_infra_test.go` 的
     `TestRepeatableReadSnapshotHidesCommittedWinner` 釘住。
 
 33. **⭐ Go 的零值 `""` 與 Java 的 `null` 在 JSON 與 SQL 都不是同一個值**：
@@ -315,7 +315,7 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     PostgreSQL 沒有 gap lock，所以團隊 Java 版結構上不可能踩到。
 
     **解法：把扣款交易明寫成 READ COMMITTED**（`sql.TxOptions{Isolation:
-    sql.LevelReadCommitted}`，見 `internal/wallet/store.debitTxOptions`）。
+    sql.LevelReadCommitted}`，見 `internal/wallet/repository.debitTxOptions`）。
     RC 不對搜尋下 gap lock，環就斷了。⚠️ 這不是效能調校，是**等價**——
     Java 版跑在 PostgreSQL 上，而 PG 的預設就是 RC；沿用 MySQL 的 RR 預設
     等於憑空引入兩個原版不存在的失敗模式（另一個是地雷 #32）。
@@ -356,7 +356,7 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     → T2 樂觀鎖過關 → T2 INSERT 撞 1062`。
 
     解法：與 debit 的 `compensate` 對稱，**同交易內回沖**
-    （`internal/wallet/store.compensateCredit`），再回查贏家。
+    （`internal/wallet/repository.compensateCredit`），再回查贏家。
     ⚠️ 回沖加回的必須是**實際解凍量**，不是請求帶進來的 `unfreezeAmount`：
     Java 的 `max(0, frozen - unfreeze)` 會夾住超額請求，兩者可能不同。
     加回請求值會讓 `frozen_amount` 憑空長大 → 可用餘額變小 → **假的餘額不足**，
@@ -396,7 +396,7 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
     間隙一路鎖到 supremum —— 那正是下一筆下注要 INSERT 新 outbox 列的位置。
     於是帳務交易卡在 insert intention lock 上，**卡多久取決於 Kafka 什麼時候 ack**。
     ⚠️ 症狀是「下注偶爾變慢」，沒有任何錯誤訊息指向 poller。
-    解法：投遞交易明寫 READ COMMITTED（`internal/wallet/store.outboxTxOptions`），
+    解法：投遞交易明寫 READ COMMITTED（`internal/wallet/repository.outboxTxOptions`），
     RC 不對搜尋下 gap lock。PostgreSQL 沒有 gap lock，所以團隊 Java 版結構上不會踩到。
     已於 2026-08-02 對 MySQL 8.4 實測驗證兩個方向，由
     `TestOutboxClaimIsolationDecidesIfAccountingIsBlocked` 釘住。
@@ -646,7 +646,7 @@ CI 用的是同一份 `deploy/docker-compose.infra.yml` 與同一份 `.env.examp
 而漂移的方向必定是「CI 過了、本機不過」。
 
 ⚠️ **為什麼 infra 那個 job 是必要的而不是加分**：不加 `-tags=infra` 時，
-`internal/wallet/store` 顯示的是 **`[no test files]`**——帳務的三條 SQL、
+`internal/wallet/repository` 顯示的是 **`[no test files]`**——帳務的三條 SQL、
 三個隔離級別、gap lock 死鎖、1062 補償回沖**全部沒有被執行到**，而測試是綠的。
 
 **建映像**（七個服務共用一份 `Dockerfile`，`--build-arg` 選一個）：

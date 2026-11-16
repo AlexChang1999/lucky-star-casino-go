@@ -6,7 +6,7 @@
 #   go test -race -tags=infra ./...  要真的 MySQL 與 Kafka 才跑得動
 #
 # 而**帳務正確性的證據全部在第二半**（隔離級別、gap lock 死鎖、1062 補償回沖、
-# outbox 的鎖範圍與 filesort）。少了 infra 那個 job，`internal/wallet/store`
+# outbox 的鎖範圍與 filesort）。少了 infra 那個 job，`internal/wallet/repository`
 # 在預設 build tag 下是 `[no test files]`——也就是說最關鍵的那包 SQL
 # 覆蓋率是 0，而 CI 會是綠的。**這正是這份檔案要防的事。**
 name: CI

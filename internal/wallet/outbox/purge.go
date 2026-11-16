@@ -20,13 +20,13 @@ const (
 	// 加一個沒人會去改的設定項只是多一個要驗證的輸入（CLAUDE.md §2）。
 	purgeHourUTC = 20
 
-	// purgeTimeout 是單次清理的上限。分塊刪除（store.purgeChunkSize）之下，
+	// purgeTimeout 是單次清理的上限。分塊刪除（repository.purgeChunkSize）之下，
 	// 積了幾百萬列的第一次清理會跑很多塊，所以這裡給得比投遞的一輪寬鬆得多。
 	purgeTimeout = 10 * time.Minute
 )
 
-// purgeStore 是清理排程需要的儲存能力（同樣定義在消費端）。
-type purgeStore interface {
+// purgeRepository 是清理排程需要的儲存能力（同樣定義在消費端）。
+type purgeRepository interface {
 	PurgeSentOutbox(ctx context.Context, before time.Time) (int64, error)
 }
 
@@ -39,17 +39,17 @@ type purgeStore interface {
 // 所以這是純粹的**維運問題**（磁碟、備份時間），而那正是它在 Java 版一直沒被
 // 發現的原因——沒有任何指標會變差，直到磁碟滿。
 type Purger struct {
-	store     purgeStore
+	repo      purgeRepository
 	retention time.Duration
 	logger    *slog.Logger
 }
 
 // NewPurger 組出清理排程。
-func NewPurger(s purgeStore, retention time.Duration, logger *slog.Logger) *Purger {
+func NewPurger(s purgeRepository, retention time.Duration, logger *slog.Logger) *Purger {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Purger{store: s, retention: retention, logger: logger}
+	return &Purger{repo: s, retention: retention, logger: logger}
 }
 
 // Run 每天在 purgeHourUTC 跑一次清理，直到 ctx 被取消。它會阻塞。
@@ -93,7 +93,7 @@ func (p *Purger) RunOnce(ctx context.Context) {
 	purgeCtx, cancel := context.WithTimeout(ctx, purgeTimeout)
 	defer cancel()
 
-	deleted, err := p.store.PurgeSentOutbox(purgeCtx, before)
+	deleted, err := p.repo.PurgeSentOutbox(purgeCtx, before)
 	switch {
 	case errors.Is(err, context.Canceled):
 		// ⚠️ 收工時剛好在清理，不是故障。記成 Error 會讓「每次關機都有一行紅的」

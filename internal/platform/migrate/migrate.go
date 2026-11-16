@@ -64,7 +64,7 @@ func New(db *sql.DB, opts ...goose.ProviderOption) (*goose.Provider, error) {
 
 // VerifyVersion 確認資料庫的 schema 版本與這個 binary 帶的一致。
 //
-// ⭐ 這是地雷 #17 的**真正解法**，而 internal/wallet/store.VerifyWalletSchema
+// ⭐ 這是地雷 #17 的**真正解法**，而 internal/wallet/repository.VerifyWalletSchema
 // 只是它的補集：
 //
 //   - VerifyVersion 是**通用**的——任何未來的 migration 忘了跑都會被抓到，

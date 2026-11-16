@@ -25,7 +25,7 @@ type CreditResult struct {
 // ⚠️ 這裡**不重試**樂觀鎖衝突（地雷 #36）：重試權在知道冪等鍵怎麼來的那一層，
 // 而且悄悄重掉會讓呼叫端從此再也看不到 409。
 func (s *Service) Credit(ctx context.Context, m domain.Movement) (CreditResult, error) {
-	r, err := s.store.Credit(ctx, m)
+	r, err := s.repo.Credit(ctx, m)
 	if err != nil {
 		return CreditResult{}, s.classify(err, m)
 	}

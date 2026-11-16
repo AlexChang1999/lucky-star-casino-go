@@ -1,10 +1,10 @@
-// Package service 是 wallet 的應用層：把 store 的 sentinel error 分類成
+// Package service 是 wallet 的應用層：把 repository 的 sentinel error 分類成
 // 「對外有意義的結果碼」，並在**錯誤發生的地方**記錄一次日誌。
 //
-// 分層（docs/ADR-004）：handler → service → store。
+// 分層（docs/ADR-004）：handler → service → repository。
 //   - handler 認得 HTTP（狀態碼、信封、JSON），不認得 SQL 的錯誤。
 //   - service 認得帳務的結果（錢包不存在、餘額不足…），不認得 HTTP。
-//   - store 認得 SQL，不認得誰在呼叫它。
+//   - repository 認得 SQL，不認得誰在呼叫它。
 //
 // ⭐ 為什麼這一層不是多餘的：舊的 httpapi 把「sentinel → 狀態碼」與
 // 「該不該記日誌、記幾級」寫在同一個函式裡。換掉 HTTP 框架時那段邏輯得跟著
@@ -17,15 +17,15 @@ import (
 	"time"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
-	walletstore "github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
 )
 
-// Store 是這一層需要的帳務能力，定義在消費端（CLAUDE.md §2）。
-// *walletstore.Repository 不知道這個介面存在。
-type Store interface {
-	Debit(ctx context.Context, m domain.Movement) (walletstore.DebitResult, error)
-	Credit(ctx context.Context, m domain.Movement) (walletstore.CreditResult, error)
-	// Balance 回傳**總餘額**（不是可用餘額），錢包不存在回 walletstore.ErrWalletNotFound。
+// Repository 是這一層需要的帳務能力，定義在消費端（CLAUDE.md §2）。
+// *repository.Repository 不知道這個介面存在。
+type Repository interface {
+	Debit(ctx context.Context, m domain.Movement) (repository.DebitResult, error)
+	Credit(ctx context.Context, m domain.Movement) (repository.CreditResult, error)
+	// Balance 回傳**總餘額**（不是可用餘額），錢包不存在回 repository.ErrWalletNotFound。
 	Balance(ctx context.Context, playerID int64) (int64, error)
 }
 
@@ -39,21 +39,21 @@ type Quota interface {
 	ReleaseGiftQuota(ctx context.Context, senderID, receiverID int64, amount domain.Amount)
 }
 
-// GiftStore 是贈禮狀態單的存取能力，定義在消費端（CLAUDE.md §2）。
-// 與 Store 分開，是因為只有贈禮用得到它——debit / credit 的測試替身不必跟著長出十個方法。
+// GiftRepository 是贈禮狀態單的存取能力，定義在消費端（CLAUDE.md §2）。
+// 與 Repository 分開，是因為只有贈禮用得到它——debit / credit 的測試替身不必跟著長出十個方法。
 //
 // 回傳 bool 的方法都是條件式轉移：false 代表「別人已經先轉走了」，不是錯誤。
-type GiftStore interface {
-	InsertGift(ctx context.Context, key string, senderID, receiverID int64, amount domain.Amount, nextAttemptAt time.Time) (walletstore.GiftTransfer, error)
-	GiftByKey(ctx context.Context, key string) (walletstore.GiftTransfer, error)
-	GiftByID(ctx context.Context, id int64) (walletstore.GiftTransfer, error)
+type GiftRepository interface {
+	InsertGift(ctx context.Context, key string, senderID, receiverID int64, amount domain.Amount, nextAttemptAt time.Time) (repository.GiftTransfer, error)
+	GiftByKey(ctx context.Context, key string) (repository.GiftTransfer, error)
+	GiftByID(ctx context.Context, id int64) (repository.GiftTransfer, error)
 	DeletePendingGift(ctx context.Context, id int64) (bool, error)
 	MarkGiftDebited(ctx context.Context, id, debitTxID, senderBalanceAfter int64, nextAttemptAt time.Time) (bool, error)
 	MarkGiftCompleted(ctx context.Context, id, creditTxID, receiverBalanceAfter int64) (bool, error)
 	MarkGiftRefunding(ctx context.Context, id int64, nextAttemptAt time.Time, lastErr string) (bool, error)
 	MarkGiftRefunded(ctx context.Context, id, senderBalanceAfter int64) (bool, error)
-	ScheduleGiftRetry(ctx context.Context, id int64, status walletstore.GiftStatus, attempts int, nextAttemptAt time.Time, lastErr string) (bool, error)
-	DueGifts(ctx context.Context, now time.Time, limit int) ([]walletstore.GiftTransfer, error)
+	ScheduleGiftRetry(ctx context.Context, id int64, status repository.GiftStatus, attempts int, nextAttemptAt time.Time, lastErr string) (bool, error)
+	DueGifts(ctx context.Context, now time.Time, limit int) ([]repository.GiftTransfer, error)
 	// CreditLanded 回答「這把入帳冪等鍵的流水是否已經存在」。轉退款前用它確認入帳沒有悄悄成功。
 	CreditLanded(ctx context.Context, idempotencyKey string) (bool, error)
 }
@@ -64,8 +64,8 @@ type GiftStore interface {
 // 這是與 go-layered-arch skill 「provider 回傳 interface」刻意不同的地方
 // （CLAUDE.md §2、docs/ADR-004）。
 type Service struct {
-	store  Store
-	gifts  GiftStore
+	repo   Repository
+	gifts  GiftRepository
 	quota  Quota
 	logger *slog.Logger
 
@@ -74,9 +74,9 @@ type Service struct {
 }
 
 // New 組出 Service。logger 為 nil 時退回 slog.Default()。
-func New(store Store, gifts GiftStore, quota Quota, logger *slog.Logger) *Service {
+func New(repo Repository, gifts GiftRepository, quota Quota, logger *slog.Logger) *Service {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{store: store, gifts: gifts, quota: quota, logger: logger, now: time.Now}
+	return &Service{repo: repo, gifts: gifts, quota: quota, logger: logger, now: time.Now}
 }

@@ -11,7 +11,7 @@ import (
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/quota"
-	walletstore "github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
 )
 
 type fakeQuota struct {
@@ -49,14 +49,14 @@ func (f *fakeQuota) ReleaseBankruptcyAid(_ context.Context, playerID int64) {
 // aidService 組出一個時鐘固定的 Service。
 // 2026-11-16T17:00:00Z = 台北 2026-11-17 01:00——UTC 與台北的「今天」刻意不同天，
 // 日界用錯時區的話冪等鍵的日期會對不上。
-func aidService(st *fakeStore, q *fakeQuota) *Service {
+func aidService(st *fakeRepository, q *fakeQuota) *Service {
 	s := New(st, nil, q, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	s.now = func() time.Time { return time.Date(2026, 11, 16, 17, 0, 0, 0, time.UTC) }
 	return s
 }
 
 func TestBankruptcyAidEligibility(t *testing.T) {
-	notFound := fmt.Errorf("%w: playerID=7", walletstore.ErrWalletNotFound)
+	notFound := fmt.Errorf("%w: playerID=7", repository.ErrWalletNotFound)
 	tests := []struct {
 		name        string
 		balance     int64
@@ -82,7 +82,7 @@ func TestBankruptcyAidEligibility(t *testing.T) {
 		{name: "Redis 掛了 → 500，不入帳", balance: 10, claimErr: errors.New("connection refused"),
 			wantCode: CodeInternal, wantClaims: 1},
 		{name: "入帳失敗 → 釋放當日鎖並保留原因", balance: 10,
-			creditErr: fmt.Errorf("%w: v=1", walletstore.ErrConcurrentModification),
+			creditErr: fmt.Errorf("%w: v=1", repository.ErrConcurrentModification),
 			wantCode:  CodeConcurrentModification, wantClaims: 1, wantCredits: 1, wantRelease: 1},
 		// ⭐ 冪等命中代表 Redis 曾被清空但 DB 已有當日紀錄：視為領過，且**保留**鎖。
 		{name: "冪等命中 → 視為已領過，不釋放鎖", balance: 10, idempotent: true,
@@ -90,9 +90,9 @@ func TestBankruptcyAidEligibility(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			st := &fakeStore{
+			st := &fakeRepository{
 				balance: tt.balance, balanceErr: tt.balanceErr, creditErr: tt.creditErr,
-				creditResult: walletstore.CreditResult{
+				creditResult: repository.CreditResult{
 					TransactionID: 9, PlayerID: 7, Amount: 1000,
 					BalanceBefore: domain.Amount(tt.balance), BalanceAfter: domain.Amount(tt.balance + 1000),
 					Idempotent: tt.idempotent,
@@ -126,10 +126,10 @@ func TestBankruptcyAidEligibility(t *testing.T) {
 	}
 }
 
-// TestBankruptcyAidCreditIntent 釘住送進 store 的那筆入帳長什麼樣：金額、子類型、
+// TestBankruptcyAidCreditIntent 釘住送進 repository 的那筆入帳長什麼樣：金額、子類型、
 // 以及冪等鍵的日期必須是**台北**的今天，並且與搶鎖用的是同一個時刻。
 func TestBankruptcyAidCreditIntent(t *testing.T) {
-	st := &fakeStore{balance: 0}
+	st := &fakeRepository{balance: 0}
 	q := &fakeQuota{}
 	if _, err := aidService(st, q).BankruptcyAid(context.Background(), 7); err != nil {
 		t.Fatal(err)
@@ -148,7 +148,7 @@ func TestBankruptcyAidCreditIntent(t *testing.T) {
 
 // 釋放鎖要釋放的是同一個玩家，不是別人。
 func TestBankruptcyAidReleasesOwnPlayer(t *testing.T) {
-	st := &fakeStore{balance: 0, creditErr: errors.New("boom")}
+	st := &fakeRepository{balance: 0, creditErr: errors.New("boom")}
 	q := &fakeQuota{}
 	_, _ = aidService(st, q).BankruptcyAid(context.Background(), 7)
 	if q.released != 1 || q.releasedID != 7 {

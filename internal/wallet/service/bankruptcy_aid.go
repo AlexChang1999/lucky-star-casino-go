@@ -53,7 +53,7 @@ func (s *Service) BankruptcyAid(ctx context.Context, playerID int64) (Bankruptcy
 		return BankruptcyAidResult{}, &Error{Code: CodeInternal, Err: err}
 	}
 
-	balance, err := s.store.Balance(ctx, playerID)
+	balance, err := s.repo.Balance(ctx, playerID)
 	if err != nil {
 		return BankruptcyAidResult{}, s.classify(err, m)
 	}

@@ -3,12 +3,12 @@
 // outbox 投遞側的 infra 測試。需要真的跑起來的 MySQL：
 //
 //	docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env up -d --wait
-//	go test -race -tags=infra ./internal/wallet/store/
+//	go test -race -tags=infra ./internal/wallet/repository/
 //
 // ⚠️ 這一檔完全不碰 Kafka：投遞交給 PublishFunc，測試傳一個假的進去。
 // Kafka 的部分由 internal/wallet/outbox 的測試負責——分開的好處是這裡可以
 // 用「這一批我只成功送出第 1 與第 3 筆」這種在真實 broker 上很難重現的情境。
-package store
+package repository
 
 import (
 	"context"

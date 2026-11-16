@@ -33,8 +33,8 @@ import (
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/memberconsume"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/outbox"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/quota"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/service"
-	walletstore "github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
 )
 
 // startupTimeout 是「連上 DB + 兩項開機自檢」的總預算。
@@ -118,15 +118,15 @@ func run() error {
 	if err := migrate.VerifyVersion(startupCtx, sqlDB); err != nil {
 		return err
 	}
-	if err := walletstore.VerifyWalletSchema(startupCtx, db); err != nil {
+	if err := repository.VerifyWalletSchema(startupCtx, db); err != nil {
 		return fmt.Errorf("wallet schema 自檢失敗: %w", err)
 	}
 	logger.Info("開機自檢通過（schema 版本與帳務約束）")
 
 	// ── 組裝 ────────────────────────────────────────────────────────────
 	// 一路傳值下去，沒有容器、沒有反射、沒有 init()。
-	// 依賴方向只往下：handler → service → store（docs/ADR-004）。
-	repo := walletstore.NewRepository(db, logger)
+	// 依賴方向只往下：handler → service → repository（docs/ADR-004）。
+	repo := repository.NewRepository(db, logger)
 
 	// Redis 額度層：**不是快取**而是額度狀態本身（地雷 #16），故障策略是 fail-closed。
 	// ⚠️ 這裡不 Ping：Redis 掛了不該讓帳務服務開不起來（debit/credit 用不到它），

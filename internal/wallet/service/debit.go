@@ -18,11 +18,11 @@ type DebitResult struct {
 
 // Debit 執行一次已驗證的扣款意圖。失敗時回 *Error（見 classify）。
 //
-// ⚠️ 結果裡的 PlayerID / Amount 取自 **store 的回傳**而不是請求：冪等命中時 Java 回的是
+// ⚠️ 結果裡的 PlayerID / Amount 取自 **repository 的回傳**而不是請求：冪等命中時 Java 回的是
 // **原交易**的值（toIdempotentResponse:135-142），冪等鍵跨玩家碰撞時兩者會不同——
 // 那是刻意保留的診斷訊號，不是 bug。
 func (s *Service) Debit(ctx context.Context, m domain.Movement) (DebitResult, error) {
-	r, err := s.store.Debit(ctx, m)
+	r, err := s.repo.Debit(ctx, m)
 	if err != nil {
 		return DebitResult{}, s.classify(err, m)
 	}

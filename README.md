@@ -180,7 +180,7 @@ docker compose -f deploy/docker-compose.infra.yml --env-file deploy/.env down
 ```
 
 > **⭐ 為什麼 `go test -race ./...` 全綠還不夠？**
-> `internal/wallet/store`（帳務的三條 SQL、隔離級別、gap lock、1062 補償）的測試
+> `internal/wallet/repository`（帳務的三條 SQL、隔離級別、gap lock、1062 補償）的測試
 > 全部帶 `//go:build infra`——不加那個 tag，那個套件顯示的是 **`[no test files]`**：
 > 最關鍵的一包程式碼覆蓋率是 0，而測試是綠的。
 > 所以 CI 有一個**專門的 job** 起真的 MySQL 與 Kafka，而 `.golangci.yml` 也把

@@ -2,7 +2,7 @@
 //
 // 為什麼是一個**正式套件**而不是複製一份 helper 到每個測試檔：Go 的
 // `_test.go` 不能跨套件共用，而「建一個臨時資料庫、用完就丟」這件事
-// internal/platform/migrate 與 internal/wallet/store 都需要，之後每個服務的
+// internal/platform/migrate 與 internal/wallet/repository 都需要，之後每個服務的
 // store 測試也會需要。標準庫的 `net/http/httptest` 就是同一個形狀——
 // **測試支援程式碼是正式程式碼，只是沒有人在正式路徑上 import 它**。
 //

@@ -11,19 +11,19 @@ import (
 	"time"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/config"
-	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
 )
 
-// fakeStore 讓 poller 的測試完全不必碰 MySQL 或 Kafka。
+// fakeRepository 讓 poller 的測試完全不必碰 MySQL 或 Kafka。
 //
 // ⭐ 它之所以只有一個方法，是因為介面定義在**消費端**（見 poller.go 的
-// eventStore）。若介面是由 store 套件定義的「Repository 的全部方法」，
+// eventRepository）。若介面是由 repository 套件定義的「Repository 的全部方法」，
 // 這個假物件就得跟著長出 Debit、Credit……而它們與投遞邏輯毫無關係。
-type fakeStore struct {
-	publishPending func(ctx context.Context, batchSize int, publish store.PublishFunc) (store.PublishStats, error)
+type fakeRepository struct {
+	publishPending func(ctx context.Context, batchSize int, publish repository.PublishFunc) (repository.PublishStats, error)
 }
 
-func (f fakeStore) PublishPending(ctx context.Context, batchSize int, publish store.PublishFunc) (store.PublishStats, error) {
+func (f fakeRepository) PublishPending(ctx context.Context, batchSize int, publish repository.PublishFunc) (repository.PublishStats, error) {
 	return f.publishPending(ctx, batchSize, publish)
 }
 
@@ -32,12 +32,12 @@ func testOutboxConfig() config.Outbox {
 }
 
 // noopPublish 是一個什麼都不送的 PublishFunc。
-func noopPublish(_ context.Context, _ []store.PendingEvent) ([]int64, error) { return nil, nil }
+func noopPublish(_ context.Context, _ []repository.PendingEvent) ([]int64, error) { return nil, nil }
 
 func TestPollerRunStopsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	s := fakeStore{publishPending: func(context.Context, int, store.PublishFunc) (store.PublishStats, error) {
-		return store.PublishStats{}, nil
+	s := fakeRepository{publishPending: func(context.Context, int, repository.PublishFunc) (repository.PublishStats, error) {
+		return repository.PublishStats{}, nil
 	}}
 
 	done := make(chan struct{})
@@ -71,11 +71,11 @@ func TestPollerRoundIgnoresShutdownSignal(t *testing.T) {
 	release := make(chan struct{})
 	var roundErr error
 
-	s := fakeStore{publishPending: func(roundCtx context.Context, _ int, _ store.PublishFunc) (store.PublishStats, error) {
+	s := fakeRepository{publishPending: func(roundCtx context.Context, _ int, _ repository.PublishFunc) (repository.PublishStats, error) {
 		close(entered)
 		<-release // 卡在這裡，模擬「正在等 Kafka ack」
 		roundErr = roundCtx.Err()
-		return store.PublishStats{}, nil
+		return repository.PublishStats{}, nil
 	}}
 
 	done := make(chan struct{})
@@ -106,9 +106,9 @@ func TestPollerRoundIgnoresShutdownSignal(t *testing.T) {
 // 只有事件從此再也沒送出去過。典型的「每一項檢查都顯示正常」故障。
 func TestPollerKeepsRunningAfterFailure(t *testing.T) {
 	var calls atomic.Int64
-	s := fakeStore{publishPending: func(context.Context, int, store.PublishFunc) (store.PublishStats, error) {
+	s := fakeRepository{publishPending: func(context.Context, int, repository.PublishFunc) (repository.PublishStats, error) {
 		calls.Add(1)
-		return store.PublishStats{Fetched: 1, Failed: 1}, errors.New("kafka 掛了")
+		return repository.PublishStats{Fetched: 1, Failed: 1}, errors.New("kafka 掛了")
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -141,16 +141,16 @@ func TestClassifyRound(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		stats store.PublishStats
+		stats repository.PublishStats
 		err   error
 		want  roundOutcome
 	}{
-		{"沒事做", store.PublishStats{}, nil, outcomeIdle},
-		{"撈取本身失敗（DB 不通）", store.PublishStats{}, boom, outcomeStalled},
-		{"整批送出成功", store.PublishStats{Fetched: 3, Sent: 3}, nil, outcomeProgress},
-		{"部分失敗但有送出去", store.PublishStats{Fetched: 3, Sent: 2, Failed: 1}, boom, outcomeProgress},
-		{"撈到了但一則都沒送成", store.PublishStats{Fetched: 3, Failed: 3}, boom, outcomeStalled},
-		{"一則都沒送成且沒有 error", store.PublishStats{Fetched: 3, Failed: 3}, nil, outcomeStalled},
+		{"沒事做", repository.PublishStats{}, nil, outcomeIdle},
+		{"撈取本身失敗（DB 不通）", repository.PublishStats{}, boom, outcomeStalled},
+		{"整批送出成功", repository.PublishStats{Fetched: 3, Sent: 3}, nil, outcomeProgress},
+		{"部分失敗但有送出去", repository.PublishStats{Fetched: 3, Sent: 2, Failed: 1}, boom, outcomeProgress},
+		{"撈到了但一則都沒送成", repository.PublishStats{Fetched: 3, Failed: 3}, boom, outcomeStalled},
+		{"一則都沒送成且沒有 error", repository.PublishStats{Fetched: 3, Failed: 3}, nil, outcomeStalled},
 	}
 
 	for _, tt := range tests {
@@ -186,7 +186,7 @@ func TestNextDelay(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p := NewPoller(fakeStore{}, noopPublish,
+			p := NewPoller(fakeRepository{}, noopPublish,
 				config.Outbox{PollInterval: tt.interval, BatchSize: 1, Retention: time.Hour}, discardLogger())
 			if got := p.nextDelay(tt.current, tt.outcome); got != tt.want {
 				t.Errorf("nextDelay(%v, %v) = %v, want %v", tt.current, tt.outcome, got, tt.want)
@@ -207,9 +207,9 @@ func TestNextDelay(t *testing.T) {
 // 精準的部分由 TestNextDelay 逐格釘死，這裡只證明它真的接上了迴圈。
 func TestPollerBacksOffWhenNothingIsDelivered(t *testing.T) {
 	var calls atomic.Int64
-	s := fakeStore{publishPending: func(context.Context, int, store.PublishFunc) (store.PublishStats, error) {
+	s := fakeRepository{publishPending: func(context.Context, int, repository.PublishFunc) (repository.PublishStats, error) {
 		calls.Add(1)
-		return store.PublishStats{Fetched: 1, Failed: 1}, errors.New("kafka 掛了")
+		return repository.PublishStats{Fetched: 1, Failed: 1}, errors.New("kafka 掛了")
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -254,8 +254,8 @@ func TestPollerWarnsWhenBatchIsFull(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			logs := &bytes.Buffer{}
-			s := fakeStore{publishPending: func(context.Context, int, store.PublishFunc) (store.PublishStats, error) {
-				return store.PublishStats{Fetched: tt.fetched, Sent: tt.fetched}, nil
+			s := fakeRepository{publishPending: func(context.Context, int, repository.PublishFunc) (repository.PublishStats, error) {
+				return repository.PublishStats{Fetched: tt.fetched, Sent: tt.fetched}, nil
 			}}
 
 			p := NewPoller(s, noopPublish, testOutboxConfig(),
@@ -269,7 +269,7 @@ func TestPollerWarnsWhenBatchIsFull(t *testing.T) {
 	}
 }
 
-// TestPollerPassesBatchSizeAndPublish 釘住設定值真的有走到 store。
+// TestPollerPassesBatchSizeAndPublish 釘住設定值真的有走到 repository。
 //
 // ⚠️ 這條看起來瑣碎，但 batchSize 傳錯（例如傳成 0）的症狀是
 // 「LIMIT 0 永遠撈不到事件」——outbox 只進不出，而服務完全正常。
@@ -277,7 +277,7 @@ func TestPollerPassesBatchSizeAndPublish(t *testing.T) {
 	gotBatchSize := make(chan int, 1)
 	publishCalled := make(chan struct{}, 1)
 
-	publish := store.PublishFunc(func(context.Context, []store.PendingEvent) ([]int64, error) {
+	publish := repository.PublishFunc(func(context.Context, []repository.PendingEvent) ([]int64, error) {
 		select {
 		case publishCalled <- struct{}{}:
 		default:
@@ -285,14 +285,14 @@ func TestPollerPassesBatchSizeAndPublish(t *testing.T) {
 		return nil, nil
 	})
 
-	s := fakeStore{publishPending: func(ctx context.Context, batchSize int, p store.PublishFunc) (store.PublishStats, error) {
+	s := fakeRepository{publishPending: func(ctx context.Context, batchSize int, p repository.PublishFunc) (repository.PublishStats, error) {
 		select {
 		case gotBatchSize <- batchSize:
 		default:
 		}
-		// store 會在交易裡呼叫 publish；這裡照做，證明傳進來的就是我們給的那一個。
+		// repository 會在交易裡呼叫 publish；這裡照做，證明傳進來的就是我們給的那一個。
 		_, _ = p(ctx, nil)
-		return store.PublishStats{}, nil
+		return repository.PublishStats{}, nil
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -310,6 +310,6 @@ func TestPollerPassesBatchSizeAndPublish(t *testing.T) {
 	select {
 	case <-publishCalled:
 	case <-time.After(5 * time.Second):
-		t.Fatal("poller 傳給 store 的不是我們給的 PublishFunc")
+		t.Fatal("poller 傳給 repository 的不是我們給的 PublishFunc")
 	}
 }

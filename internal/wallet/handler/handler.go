@@ -1,6 +1,6 @@
 // Package handler 是 wallet 的 HTTP 邊界（Fiber）。
 //
-// 這一層**很薄，而且必須保持很薄**：帳務語義在 internal/wallet/store，
+// 這一層**很薄，而且必須保持很薄**：帳務語義在 internal/wallet/repository，
 // 驗證規則在 internal/wallet/domain，錯誤分類在 internal/wallet/service。
 // 這裡只做三件事——解 JSON、把 service 的結果碼翻成狀態碼、包成 Java 版的回應信封。
 //

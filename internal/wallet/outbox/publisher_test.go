@@ -8,7 +8,7 @@ import (
 
 	"github.com/segmentio/kafka-go"
 
-	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
 )
 
 func discardLogger() *slog.Logger {
@@ -86,32 +86,32 @@ func TestNewWriterPinsSilentDefaults(t *testing.T) {
 func TestMessagesFor(t *testing.T) {
 	tests := []struct {
 		name    string
-		event   store.PendingEvent
+		event   repository.PendingEvent
 		wantKey []byte
 		why     string
 	}{
 		{
 			name:    "一般事件：key 是 playerID 的字串",
-			event:   store.PendingEvent{ID: 1, Topic: "wallet.debit", KafkaKey: ptr("42"), Payload: `{"a":1}`},
+			event:   repository.PendingEvent{ID: 1, Topic: "wallet.debit", KafkaKey: ptr("42"), Payload: `{"a":1}`},
 			wantKey: []byte("42"),
 			why:     "同玩家的事件要落在同一個 partition，下游看到的順序才與帳務發生順序一致",
 		},
 		{
 			name:    "kafka_key 為 NULL 時 key 必須是 nil",
-			event:   store.PendingEvent{ID: 2, Topic: "wallet.credit", KafkaKey: nil, Payload: `{}`},
+			event:   repository.PendingEvent{ID: 2, Topic: "wallet.credit", KafkaKey: nil, Payload: `{}`},
 			wantKey: nil,
 			why:     "nil key 走隨機 partition；空 []byte 是一個確定的雜湊值，會讓所有無 key 訊息擠在同一個 partition",
 		},
 		{
 			name:    "kafka_key 是空字串時不可以變成 nil",
-			event:   store.PendingEvent{ID: 3, Topic: "wallet.credit", KafkaKey: ptr(""), Payload: `{}`},
+			event:   repository.PendingEvent{ID: 3, Topic: "wallet.credit", KafkaKey: ptr(""), Payload: `{}`},
 			wantKey: []byte(""),
 			why:     "NULL 與空字串在 SQL 與 Kafka 都是兩個值（地雷 #33），這裡混掉會讓 partition 分配跟著變",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := messagesFor([]store.PendingEvent{tt.event})
+			got := messagesFor([]repository.PendingEvent{tt.event})
 			if len(got) != 1 {
 				t.Fatalf("訊息數 = %d, want 1", len(got))
 			}
@@ -136,7 +136,7 @@ func TestMessagesFor(t *testing.T) {
 // 這一層若重排（例如為了效率先依 topic 分組），同一個玩家的
 // 「先扣款、後派彩」在下游就會變成隨機順序，而 Kafka 不會為此報錯。
 func TestMessagesForPreservesOrder(t *testing.T) {
-	events := []store.PendingEvent{
+	events := []repository.PendingEvent{
 		{ID: 10, Topic: "wallet.debit", KafkaKey: ptr("1"), Payload: `{"n":1}`},
 		{ID: 11, Topic: "wallet.credit", KafkaKey: ptr("1"), Payload: `{"n":2}`},
 		{ID: 12, Topic: "wallet.debit", KafkaKey: ptr("1"), Payload: `{"n":3}`},
