@@ -5,6 +5,33 @@
 
 ---
 
+## [refactor] — 2026-11-15 — wallet HTTP 層 Gin → Fiber v3，並拆成 handler / service / store 三層
+
+三支端點（`GET /healthz`、`POST /internal/wallet/debit`、`POST /internal/wallet/credit`）
+分三個 commit 移植；決策與取捨見 `docs/ADR-004`。**對外契約零變動**：路徑、信封、狀態碼、
+驗證訊息逐字沿用，舊 `httpapi` 的測試逐條移植並在 `-race` 下全綠。
+
+**Changed**
+
+- `internal/wallet/httpapi`（Gin，單層）→ `internal/wallet/handler`（Fiber：JSON、請求格式驗證、
+  結果碼→狀態碼、信封）+ `internal/wallet/service`（store sentinel → `Code`、錯誤在起點記一次日誌）。
+- `cmd/wallet`：`serve` 改用 `app.Listen` / `ShutdownWithContext`；`go.mod` 移除 gin、加入 fiber v3.7.0。
+
+**刻意不照 `go-layered-arch` skill 的三處**（與 `CLAUDE.md` §2 衝突，以後者為準）：不用 `container`、
+interface 放消費端（`service.New` 回傳 `*Service`）、不用 `apiprotocol` 狀態碼體系。
+
+**行為差異（已知、非契約）**
+
+- `fiber.Ctx` 不會取消：必須傳 `c.Context()`；客戶端斷線不再取消進行中的 DB 呼叫。
+- fasthttp 沒有 `ReadHeaderTimeout`；`config.HTTPServer.ReadHeaderTimeout` 在 wallet 不再使用。
+- 未命中路由的 404 body 由 Gin 的純文字改成信封 JSON。
+
+**如何驗證**：`go vet ./...`、`go vet -tags=infra ./...`、`go test -race -count=1 ./...` 全過；
+破壞驗證（422 改 400）使 `TestDebitErrorMapping` 轉紅。⚠️ **未做**：對真實 MySQL / Java 版的契約測試
+（本機 Docker 未啟動），`-tags=infra` 測試未跑。
+
+---
+
 ## [chore] — 2026-11-12 — Go 工具鏈升到 1.26.11（同線升 patch）
 
 `go.mod` 與 `Dockerfile` 的 Go 版本由 1.26.5 升到 **1.26.11**；本機安裝也由 1.25.9

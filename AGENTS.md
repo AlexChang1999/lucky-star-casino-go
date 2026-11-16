@@ -527,7 +527,7 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 | 層 | 選型 | 一句話理由 |
 |---|---|---|
 | 語言 | Go 1.25+ | 職缺共同要求；前身專案已驗證 |
-| HTTP（業務服務） | **Gin** | 9 個職缺提及最多，生態與招募現實對齊 |
+| HTTP（業務服務） | **Fiber v3** | 見 `docs/ADR-004`（取代 Gin）。⚠️ `fiber.Ctx` 不會取消，傳 `c.Context()` 給 DB |
 | HTTP（推播服務） | **標準庫 `net/http`** | 自幹 STOMP 是賣點，**不要為了統一而改** |
 | 服務間通訊 | **gRPC + Protobuf** | 取代現有的服務間 REST |
 | 寫入主庫 | **MySQL 8.4** | 見 `docs/ADR-001`（推翻團隊 ADR-001 的 PG） |
@@ -538,7 +538,7 @@ module path `github.com/AlexChang1999/lucky-star-casino-go`，**Go 1.25+**。
 | Log | **`log/slog`**（標準庫） | 不引入 zap/zerolog |
 | 追蹤 | OpenTelemetry + Jaeger | 跨服務鏈路是「微服務」唯一的硬證據 |
 
-**明確不做**：Echo/Fiber、NATS/RabbitMQ、Kong/APISIX、Elasticsearch（延後）、
+**明確不做**：Echo、NATS/RabbitMQ、Kong/APISIX、Elasticsearch（延後）、
 Memcached、自建區塊鏈節點、冷熱錢包、Vault/KMS、GKE。理由見藍圖 §9。
 ⚠️ **「不做」的理由比「做」更重要**——面試問「為什麼不用 X」答得出來才是判斷力。
 

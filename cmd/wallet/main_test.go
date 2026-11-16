@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofiber/fiber/v3"
+
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/config"
 )
 
@@ -111,19 +113,18 @@ func TestServeGracefulShutdown(t *testing.T) {
 
 	inHandler := make(chan struct{})
 	release := make(chan struct{})
-	mux := http.NewServeMux()
-	mux.HandleFunc("/slow", func(w http.ResponseWriter, _ *http.Request) {
+	app := fiber.New()
+	app.Get("/slow", func(c fiber.Ctx) error {
 		close(inHandler)
 		<-release
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("done"))
+		return c.SendString("done")
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	served := make(chan error, 1)
-	go func() { served <- serve(ctx, discardLogger(), testHTTPConfig(port), mux) }()
+	go func() { served <- serve(ctx, discardLogger(), testHTTPConfig(port), app) }()
 
 	waitFor(t, "伺服器開始接受連線", func() bool { return canDial(addr) })
 
@@ -184,7 +185,7 @@ func TestServeReportsListenFailure(t *testing.T) {
 	// ⚠️ 加逾時保險：serve 若因為某個平台差異而**綁得起來**，它會卡在 select
 	// 等關機訊號，測試就永遠跑不完。讓它在這裡失敗，比讓 CI 掛住好。
 	failed := make(chan error, 1)
-	go func() { failed <- serve(ctx, discardLogger(), testHTTPConfig(port), http.NewServeMux()) }()
+	go func() { failed <- serve(ctx, discardLogger(), testHTTPConfig(port), fiber.New()) }()
 
 	select {
 	case err := <-failed:
