@@ -7,6 +7,7 @@
 | **決策者** | 單人（作品集專案） |
 | **影響範圍** | 業務服務的 HTTP 層。wallet 是第一個（`internal/wallet/handler`、`internal/wallet/service`） |
 | **Supersedes** | `docs/藍圖.md` §3 的「Gin ✅ 做 / Echo、Fiber ❌ 不做」兩列 |
+| **後續** | 2026-11-16 起，套件命名（`store` → `repository`、`model/dto`、`apiprotocol`）由 `docs/ADR-006` 取代；本檔的框架選擇與分層方向不變 |
 
 ---
 
@@ -36,7 +37,7 @@ service → repository，DI 在 `main`）以 Fiber 為載體。這是一個**以
    cmd/wallet/main.go（手動組裝，無 DI 容器）
         → internal/wallet/handler   解 JSON、請求格式驗證、結果碼→狀態碼、信封
         → internal/wallet/service   store 錯誤分類成 Code、錯誤只在起點記一次日誌
-        → internal/wallet/store     SQL（不變）
+        → internal/wallet/repository     SQL（不變）
    ```
 3. **`go-layered-arch` skill 的適配**（該 skill 為 `src/container` 結構而寫，與 `CLAUDE.md` §2 有三處衝突，一律以 `CLAUDE.md` 為準）：
 

@@ -10,13 +10,14 @@ import (
 	"time"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/model/enum"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/quota"
-	walletstore "github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
 )
 
-// giftWorld 同時扮演 Store（帳務）與 GiftStore（狀態單）的記憶體替身。
+// giftWorld 同時扮演 Repository（帳務）與 GiftRepository（狀態單）的記憶體替身。
 //
-// 帳務那一半刻意**照真的 store 的語義**：冪等鍵命中回原交易、餘額不足與錢包不存在回
+// 帳務那一半刻意**照真的 repository 的語義**：冪等鍵命中回原交易、餘額不足與錢包不存在回
 // 對應 sentinel。這樣測試驗的是「service 在這些語義下把狀態單推對了沒有」，
 // 而不是「fake 回什麼我就信什麼」。
 type giftWorld struct {
@@ -32,7 +33,7 @@ type giftWorld struct {
 	debitsRecorded  int
 	creditsRecorded int
 	refundsRecorded int
-	gifts           map[int64]*walletstore.GiftTransfer
+	gifts           map[int64]*repository.GiftTransfer
 	byKey           map[string]int64
 	nextGiftID      int64
 	deleted         int
@@ -50,56 +51,56 @@ func newGiftWorld(balances map[int64]int64) *giftWorld {
 		balances:    balances,
 		ledger:      map[string]ledgerRow{},
 		creditCalls: map[string]int{},
-		gifts:       map[int64]*walletstore.GiftTransfer{},
+		gifts:       map[int64]*repository.GiftTransfer{},
 		byKey:       map[string]int64{},
 	}
 }
 
-// ── Store ──────────────────────────────────────────────────────────────
+// ── Repository ──────────────────────────────────────────────────────────────
 
 func (w *giftWorld) Balance(_ context.Context, id int64) (int64, error) {
 	b, ok := w.balances[id]
 	if !ok {
-		return 0, fmt.Errorf("%w: playerID=%d", walletstore.ErrWalletNotFound, id)
+		return 0, fmt.Errorf("%w: playerID=%d", repository.ErrWalletNotFound, id)
 	}
 	return b, nil
 }
 
-func (w *giftWorld) Debit(_ context.Context, m domain.Movement) (walletstore.DebitResult, error) {
+func (w *giftWorld) Debit(_ context.Context, m domain.Movement) (repository.DebitResult, error) {
 	w.debitCalls++
 	if row, ok := w.ledger[m.IdempotencyKey]; ok {
-		return walletstore.DebitResult{TransactionID: row.txID, PlayerID: row.playerID,
+		return repository.DebitResult{TransactionID: row.txID, PlayerID: row.playerID,
 			Amount: domain.Amount(row.amount), BalanceAfter: domain.Amount(row.after), Idempotent: true}, nil
 	}
 	bal, ok := w.balances[m.PlayerID]
 	if !ok {
-		return walletstore.DebitResult{}, fmt.Errorf("%w: playerID=%d", walletstore.ErrWalletNotFound, m.PlayerID)
+		return repository.DebitResult{}, fmt.Errorf("%w: playerID=%d", repository.ErrWalletNotFound, m.PlayerID)
 	}
 	if bal < int64(m.Amount) {
-		return walletstore.DebitResult{}, walletstore.ErrInsufficientBalance
+		return repository.DebitResult{}, repository.ErrInsufficientBalance
 	}
 	w.balances[m.PlayerID] = bal - int64(m.Amount)
 	w.nextTxID++
 	w.ledger[m.IdempotencyKey] = ledgerRow{w.nextTxID, m.PlayerID, int64(m.Amount), bal - int64(m.Amount)}
 	w.debitsRecorded++
-	return walletstore.DebitResult{TransactionID: w.nextTxID, PlayerID: m.PlayerID, Amount: m.Amount,
+	return repository.DebitResult{TransactionID: w.nextTxID, PlayerID: m.PlayerID, Amount: m.Amount,
 		BalanceBefore: domain.Amount(bal), BalanceAfter: domain.Amount(bal - int64(m.Amount))}, nil
 }
 
-func (w *giftWorld) Credit(_ context.Context, m domain.Movement) (walletstore.CreditResult, error) {
+func (w *giftWorld) Credit(_ context.Context, m domain.Movement) (repository.CreditResult, error) {
 	w.creditCalls[m.IdempotencyKey]++
 	if row, ok := w.ledger[m.IdempotencyKey]; ok {
-		return walletstore.CreditResult{TransactionID: row.txID, PlayerID: row.playerID,
+		return repository.CreditResult{TransactionID: row.txID, PlayerID: row.playerID,
 			Amount: domain.Amount(row.amount), BalanceAfter: domain.Amount(row.after), Idempotent: true}, nil
 	}
 	if w.creditErr != nil {
 		if err := w.creditErr(m); err != nil {
-			return walletstore.CreditResult{}, err
+			return repository.CreditResult{}, err
 		}
 	}
 	bal, ok := w.balances[m.PlayerID]
 	if !ok {
-		return walletstore.CreditResult{}, fmt.Errorf("%w: playerID=%d", walletstore.ErrWalletNotFound, m.PlayerID)
+		return repository.CreditResult{}, fmt.Errorf("%w: playerID=%d", repository.ErrWalletNotFound, m.PlayerID)
 	}
 	w.balances[m.PlayerID] = bal + int64(m.Amount)
 	w.nextTxID++
@@ -109,43 +110,43 @@ func (w *giftWorld) Credit(_ context.Context, m domain.Movement) (walletstore.Cr
 	} else {
 		w.creditsRecorded++
 	}
-	return walletstore.CreditResult{TransactionID: w.nextTxID, PlayerID: m.PlayerID, Amount: m.Amount,
+	return repository.CreditResult{TransactionID: w.nextTxID, PlayerID: m.PlayerID, Amount: m.Amount,
 		BalanceBefore: domain.Amount(bal), BalanceAfter: domain.Amount(bal + int64(m.Amount))}, nil
 }
 
-// ── GiftStore ─────────────────────────────────────────────────────────
+// ── GiftRepository ─────────────────────────────────────────────────────────
 
-func (w *giftWorld) InsertGift(_ context.Context, key string, sender, receiver int64, amt domain.Amount, next time.Time) (walletstore.GiftTransfer, error) {
+func (w *giftWorld) InsertGift(_ context.Context, key string, sender, receiver int64, amt domain.Amount, next time.Time) (repository.GiftTransfer, error) {
 	if _, dup := w.byKey[key]; dup {
-		return walletstore.GiftTransfer{}, walletstore.ErrGiftDuplicateKey
+		return repository.GiftTransfer{}, repository.ErrGiftDuplicateKey
 	}
 	w.nextGiftID++
-	g := &walletstore.GiftTransfer{ID: w.nextGiftID, IdempotencyKey: key, SenderID: sender, ReceiverID: receiver,
-		Amount: int64(amt), Status: walletstore.GiftPending, NextAttemptAt: &next}
+	g := &repository.GiftTransfer{ID: w.nextGiftID, IdempotencyKey: key, SenderID: sender, ReceiverID: receiver,
+		Amount: int64(amt), Status: enum.GiftPending, NextAttemptAt: &next}
 	w.gifts[g.ID] = g
 	w.byKey[key] = g.ID
 	return *g, nil
 }
 
-func (w *giftWorld) GiftByKey(_ context.Context, key string) (walletstore.GiftTransfer, error) {
+func (w *giftWorld) GiftByKey(_ context.Context, key string) (repository.GiftTransfer, error) {
 	id, ok := w.byKey[key]
 	if !ok {
-		return walletstore.GiftTransfer{}, walletstore.ErrGiftNotFound
+		return repository.GiftTransfer{}, repository.ErrGiftNotFound
 	}
 	return *w.gifts[id], nil
 }
 
-func (w *giftWorld) GiftByID(_ context.Context, id int64) (walletstore.GiftTransfer, error) {
+func (w *giftWorld) GiftByID(_ context.Context, id int64) (repository.GiftTransfer, error) {
 	g, ok := w.gifts[id]
 	if !ok {
-		return walletstore.GiftTransfer{}, walletstore.ErrGiftNotFound
+		return repository.GiftTransfer{}, repository.ErrGiftNotFound
 	}
 	return *g, nil
 }
 
 func (w *giftWorld) DeletePendingGift(_ context.Context, id int64) (bool, error) {
 	g, ok := w.gifts[id]
-	if !ok || g.Status != walletstore.GiftPending {
+	if !ok || g.Status != enum.GiftPending {
 		return false, nil
 	}
 	delete(w.byKey, g.IdempotencyKey)
@@ -155,7 +156,7 @@ func (w *giftWorld) DeletePendingGift(_ context.Context, id int64) (bool, error)
 }
 
 // transition 是條件式轉移：目前狀態不是 from 就回 false（別人先轉走了）。
-func (w *giftWorld) transition(id int64, from walletstore.GiftStatus, apply func(g *walletstore.GiftTransfer)) bool {
+func (w *giftWorld) transition(id int64, from enum.GiftStatus, apply func(g *repository.GiftTransfer)) bool {
 	g, ok := w.gifts[id]
 	if !ok || g.Status != from {
 		return false
@@ -170,42 +171,42 @@ func (w *giftWorld) MarkGiftDebited(_ context.Context, id, txID, after int64, ne
 		w.markDebitedErr = nil
 		return false, err
 	}
-	return w.transition(id, walletstore.GiftPending, func(g *walletstore.GiftTransfer) {
-		g.Status, g.Attempts, g.NextAttemptAt = walletstore.GiftDebited, 0, &next
+	return w.transition(id, enum.GiftPending, func(g *repository.GiftTransfer) {
+		g.Status, g.Attempts, g.NextAttemptAt = enum.GiftDebited, 0, &next
 		g.DebitTransactionID, g.SenderBalanceAfter = &txID, &after
 	}), nil
 }
 
 func (w *giftWorld) MarkGiftCompleted(_ context.Context, id, txID, after int64) (bool, error) {
-	return w.transition(id, walletstore.GiftDebited, func(g *walletstore.GiftTransfer) {
-		g.Status, g.NextAttemptAt = walletstore.GiftCompleted, nil
+	return w.transition(id, enum.GiftDebited, func(g *repository.GiftTransfer) {
+		g.Status, g.NextAttemptAt = enum.GiftCompleted, nil
 		g.CreditTransactionID, g.ReceiverBalanceAfter = &txID, &after
 	}), nil
 }
 
 func (w *giftWorld) MarkGiftRefunding(_ context.Context, id int64, next time.Time, _ string) (bool, error) {
-	return w.transition(id, walletstore.GiftDebited, func(g *walletstore.GiftTransfer) {
-		g.Status, g.Attempts, g.NextAttemptAt = walletstore.GiftRefunding, 0, &next
+	return w.transition(id, enum.GiftDebited, func(g *repository.GiftTransfer) {
+		g.Status, g.Attempts, g.NextAttemptAt = enum.GiftRefunding, 0, &next
 	}), nil
 }
 
 func (w *giftWorld) MarkGiftRefunded(_ context.Context, id, after int64) (bool, error) {
-	return w.transition(id, walletstore.GiftRefunding, func(g *walletstore.GiftTransfer) {
-		g.Status, g.NextAttemptAt, g.SenderBalanceAfter = walletstore.GiftRefunded, nil, &after
+	return w.transition(id, enum.GiftRefunding, func(g *repository.GiftTransfer) {
+		g.Status, g.NextAttemptAt, g.SenderBalanceAfter = enum.GiftRefunded, nil, &after
 	}), nil
 }
 
-func (w *giftWorld) ScheduleGiftRetry(_ context.Context, id int64, status walletstore.GiftStatus, attempts int, next time.Time, _ string) (bool, error) {
-	return w.transition(id, status, func(g *walletstore.GiftTransfer) {
+func (w *giftWorld) ScheduleGiftRetry(_ context.Context, id int64, status enum.GiftStatus, attempts int, next time.Time, _ string) (bool, error) {
+	return w.transition(id, status, func(g *repository.GiftTransfer) {
 		g.Attempts, g.NextAttemptAt = attempts, &next
 	}), nil
 }
 
-func (w *giftWorld) DueGifts(_ context.Context, now time.Time, limit int) ([]walletstore.GiftTransfer, error) {
-	var out []walletstore.GiftTransfer
+func (w *giftWorld) DueGifts(_ context.Context, now time.Time, limit int) ([]repository.GiftTransfer, error) {
+	var out []repository.GiftTransfer
 	for _, g := range w.gifts {
 		switch g.Status {
-		case walletstore.GiftPending, walletstore.GiftDebited, walletstore.GiftRefunding:
+		case enum.GiftPending, enum.GiftDebited, enum.GiftRefunding:
 			if g.NextAttemptAt != nil && !g.NextAttemptAt.After(now) && len(out) < limit {
 				out = append(out, *g)
 			}
@@ -269,7 +270,7 @@ func TestGiftHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Gift: %v", err)
 	}
-	if r.Status != walletstore.GiftCompleted || r.Idempotent {
+	if r.Status != enum.GiftCompleted || r.Idempotent {
 		t.Fatalf("status=%s idempotent=%v, want COMPLETED/false", r.Status, r.Idempotent)
 	}
 	if h.balances[1] != 700 || h.balances[2] != 350 {
@@ -293,7 +294,7 @@ func TestGiftRejectedBeforeMoneyMovesReleasesQuota(t *testing.T) {
 		balances map[int64]int64
 		amount   int64
 		wantCode Code
-		debited  bool // 是否走到了 store.Debit（預檢沒擋住、由扣款本身拒絕）
+		debited  bool // 是否走到了 repository.Debit（預檢沒擋住、由扣款本身拒絕）
 	}{
 		{"預檢：餘額不足", map[int64]int64{1: 100, 2: 0}, 300, CodeInsufficientBalance, false},
 		{"預檢：送出方錢包不存在", map[int64]int64{2: 0}, 10, CodeGiftSenderNotFound, false},
@@ -320,7 +321,7 @@ func TestGiftRejectedBeforeMoneyMovesReleasesQuota(t *testing.T) {
 func TestGiftDebitRejectedAfterPrecheckDeletesPendingRow(t *testing.T) {
 	h := newGiftHarness(map[int64]int64{1: 500, 2: 0})
 	// 預檢看到 500，但真正扣款時餘額已經被別的請求花掉。
-	h.svc.store = &spendBeforeDebit{giftWorld: h.giftWorld, spend: 450}
+	h.svc.repo = &spendBeforeDebit{giftWorld: h.giftWorld, spend: 450}
 
 	_, err := h.svc.Gift(context.Background(), 1, 2, 300, "k")
 	if got := CodeOf(err); got != CodeInsufficientBalance {
@@ -339,7 +340,7 @@ type spendBeforeDebit struct {
 	spend int64
 }
 
-func (s *spendBeforeDebit) Debit(ctx context.Context, m domain.Movement) (walletstore.DebitResult, error) {
+func (s *spendBeforeDebit) Debit(ctx context.Context, m domain.Movement) (repository.DebitResult, error) {
 	s.balances[m.PlayerID] -= s.spend
 	return s.giftWorld.Debit(ctx, m)
 }
@@ -396,7 +397,7 @@ func TestGiftIdempotentReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-	if !again.Idempotent || again.Amount != first.Amount || again.Status != walletstore.GiftCompleted {
+	if !again.Idempotent || again.Amount != first.Amount || again.Status != enum.GiftCompleted {
 		t.Fatalf("replay = %+v, want 原本那筆 (amount=%d) 且 Idempotent", again, first.Amount)
 	}
 	if h.quota.giftReserved != 1 {
@@ -444,9 +445,9 @@ func TestGiftInsertRaceReturnsWinnerAndReleasesQuota(t *testing.T) {
 // raceOnInsert 在第一次 InsertGift 之前，先替「另一個請求」立好同鍵單，再回 1062。
 type raceOnInsert struct{ *giftWorld }
 
-func (r *raceOnInsert) InsertGift(ctx context.Context, key string, s, rc int64, a domain.Amount, next time.Time) (walletstore.GiftTransfer, error) {
+func (r *raceOnInsert) InsertGift(ctx context.Context, key string, s, rc int64, a domain.Amount, next time.Time) (repository.GiftTransfer, error) {
 	if _, err := r.giftWorld.InsertGift(ctx, key, s, rc, a, next); err != nil {
-		return walletstore.GiftTransfer{}, err
+		return repository.GiftTransfer{}, err
 	}
 	return r.giftWorld.InsertGift(ctx, key, s, rc, a, next) // 第二次撞鍵
 }
@@ -463,14 +464,14 @@ func TestGiftCrashBetweenDebitAndMarkNeverDoubleDebits(t *testing.T) {
 	if h.quota.giftReleased != 0 {
 		t.Error("錢已扣，額度不可回補")
 	}
-	if g, _ := h.GiftByKey(context.Background(), "k"); g.Status != walletstore.GiftPending {
+	if g, _ := h.GiftByKey(context.Background(), "k"); g.Status != enum.GiftPending {
 		t.Fatalf("狀態單應停在 PENDING, got %s", g.Status)
 	}
 
 	h.drain(t)
 
 	g, _ := h.GiftByKey(context.Background(), "k")
-	if g.Status != walletstore.GiftCompleted {
+	if g.Status != enum.GiftCompleted {
 		t.Fatalf("重試後狀態 = %s, want COMPLETED", g.Status)
 	}
 	if h.debitsRecorded != 1 || h.creditsRecorded != 1 {
@@ -495,7 +496,7 @@ func TestGiftCreditTransientFailureCompletesInBackground(t *testing.T) {
 
 	r, err := h.svc.Gift(context.Background(), 1, 2, 300, "k")
 	// 錢已離開送出方、入帳還在路上：回「處理中」而不是錯誤，背景接手。
-	if err != nil || r.Status != walletstore.GiftDebited {
+	if err != nil || r.Status != enum.GiftDebited {
 		t.Fatalf("got (%+v, %v), want Status=DEBITED 且 err=nil", r, err)
 	}
 	if h.balances[1] != 700 {
@@ -505,7 +506,7 @@ func TestGiftCreditTransientFailureCompletesInBackground(t *testing.T) {
 	h.drain(t)
 
 	g, _ := h.GiftByKey(context.Background(), "k")
-	if g.Status != walletstore.GiftCompleted || h.balances[2] != 300 || h.creditsRecorded != 1 {
+	if g.Status != enum.GiftCompleted || h.balances[2] != 300 || h.creditsRecorded != 1 {
 		t.Fatalf("status=%s receiver=%d credits=%d", g.Status, h.balances[2], h.creditsRecorded)
 	}
 }
@@ -516,7 +517,7 @@ func TestGiftCreditExhaustedRefundsSender(t *testing.T) {
 	before := totalMoney(h.balances)
 	h.creditErr = func(m domain.Movement) error {
 		if m.SubType == domain.SubTypeGift {
-			return walletstore.ErrConcurrentModification // 確定沒入帳的失敗，用盡次數才可退款
+			return repository.ErrConcurrentModification // 確定沒入帳的失敗，用盡次數才可退款
 		}
 		return nil // 退款那筆正常
 	}
@@ -526,7 +527,7 @@ func TestGiftCreditExhaustedRefundsSender(t *testing.T) {
 	h.drain(t)
 
 	g, _ := h.GiftByKey(context.Background(), "k")
-	if g.Status != walletstore.GiftRefunded {
+	if g.Status != enum.GiftRefunded {
 		t.Fatalf("status = %s, want REFUNDED", g.Status)
 	}
 	if h.balances[1] != 1000 || h.balances[2] != 0 {
@@ -552,7 +553,7 @@ func TestGiftCreditExhaustedRefundsSender(t *testing.T) {
 // 接收方錢包在預檢之後才消失：重試只是讓錢多卡幾秒，直接退款。
 func TestGiftReceiverWalletGoneRefundsWithoutRetrying(t *testing.T) {
 	h := newGiftHarness(map[int64]int64{1: 1000, 2: 0})
-	h.svc.store = &dropReceiverAfterDebit{giftWorld: h.giftWorld, receiver: 2}
+	h.svc.repo = &dropReceiverAfterDebit{giftWorld: h.giftWorld, receiver: 2}
 
 	_, err := h.svc.Gift(context.Background(), 1, 2, 300, "k")
 	if CodeOf(err) != CodeGiftRefunded {
@@ -571,7 +572,7 @@ type dropReceiverAfterDebit struct {
 	receiver int64
 }
 
-func (d *dropReceiverAfterDebit) Debit(ctx context.Context, m domain.Movement) (walletstore.DebitResult, error) {
+func (d *dropReceiverAfterDebit) Debit(ctx context.Context, m domain.Movement) (repository.DebitResult, error) {
 	r, err := d.giftWorld.Debit(ctx, m)
 	delete(d.balances, d.receiver)
 	return r, err
@@ -600,7 +601,7 @@ func TestGiftMovementKeys(t *testing.T) {
 	for range 80 {
 		key += "x"
 	}
-	d, c, r, err := giftMovements(walletstore.GiftTransfer{IdempotencyKey: key, SenderID: 1, ReceiverID: 2, Amount: 10})
+	d, c, r, err := giftMovements(repository.GiftTransfer{IdempotencyKey: key, SenderID: 1, ReceiverID: 2, Amount: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,13 +623,13 @@ func TestGiftMovementKeys(t *testing.T) {
 // 模擬「第 5 次入帳其實提交了、但客戶端只看到逾時」——最後必須完成，而不是退款。
 func TestGiftAmbiguousCreditFailureNeverRefundsEvenWhenExhausted(t *testing.T) {
 	h := newGiftHarness(map[int64]int64{1: 1000, 2: 0})
-	h.svc.store = &timeoutAfterCommit{giftWorld: h.giftWorld, onAttempt: GiftMaxCreditAttempts}
+	h.svc.repo = &timeoutAfterCommit{giftWorld: h.giftWorld, onAttempt: GiftMaxCreditAttempts}
 
 	_, _ = h.svc.Gift(context.Background(), 1, 2, 300, "k")
 	h.drain(t)
 
 	g, _ := h.GiftByKey(context.Background(), "k")
-	if g.Status != walletstore.GiftCompleted {
+	if g.Status != enum.GiftCompleted {
 		t.Fatalf("status = %s, want COMPLETED", g.Status)
 	}
 	if h.refundsRecorded != 0 || h.creditsRecorded != 1 || h.balances[1] != 700 || h.balances[2] != 300 {
@@ -643,19 +644,19 @@ type timeoutAfterCommit struct {
 	seen      int
 }
 
-func (t *timeoutAfterCommit) Credit(ctx context.Context, m domain.Movement) (walletstore.CreditResult, error) {
+func (t *timeoutAfterCommit) Credit(ctx context.Context, m domain.Movement) (repository.CreditResult, error) {
 	if m.SubType != domain.SubTypeGift {
 		return t.giftWorld.Credit(ctx, m)
 	}
 	t.seen++
 	switch {
 	case t.seen < t.onAttempt:
-		return walletstore.CreditResult{}, errors.New("i/o timeout")
+		return repository.CreditResult{}, errors.New("i/o timeout")
 	case t.seen == t.onAttempt:
 		if _, err := t.giftWorld.Credit(ctx, m); err != nil {
-			return walletstore.CreditResult{}, err
+			return repository.CreditResult{}, err
 		}
-		return walletstore.CreditResult{}, errors.New("commit timeout") // 已提交，客戶端不知道
+		return repository.CreditResult{}, errors.New("commit timeout") // 已提交，客戶端不知道
 	}
 	return t.giftWorld.Credit(ctx, m)
 }
@@ -674,7 +675,7 @@ func TestGiftAmbiguousFailureKeepsRetryingNeverRefunds(t *testing.T) {
 		}
 	}
 	g, _ := h.GiftByKey(context.Background(), "k")
-	if g.Status != walletstore.GiftDebited || h.refundsRecorded != 0 {
+	if g.Status != enum.GiftDebited || h.refundsRecorded != 0 {
 		t.Fatalf("status=%s refunds=%d, want DEBITED/0（錢卡在途中好過兩邊都拿到）", g.Status, h.refundsRecorded)
 	}
 }
@@ -684,7 +685,7 @@ func TestGiftAmbiguousFailureKeepsRetryingNeverRefunds(t *testing.T) {
 // 拿掉那個檢查，這個測試會紅。
 func TestGiftDoesNotRefundWhenCreditAlreadyLanded(t *testing.T) {
 	h := newGiftHarness(map[int64]int64{1: 1000, 2: 0})
-	h.svc.store = &alwaysConflictOnGiftCredit{giftWorld: h.giftWorld}
+	h.svc.repo = &alwaysConflictOnGiftCredit{giftWorld: h.giftWorld}
 	// 別的副本已把入帳做完（流水存在），但這個副本一路只看到衝突。
 	h.ledger["k:gift:credit"] = ledgerRow{txID: 99, playerID: 2, amount: 300, after: 300}
 
@@ -698,16 +699,16 @@ func TestGiftDoesNotRefundWhenCreditAlreadyLanded(t *testing.T) {
 	if h.refundsRecorded != 0 {
 		t.Fatalf("入帳流水已存在卻退款了 %d 次", h.refundsRecorded)
 	}
-	if g, _ := h.GiftByKey(context.Background(), "k"); g.Status == walletstore.GiftRefunded || g.Status == walletstore.GiftRefunding {
+	if g, _ := h.GiftByKey(context.Background(), "k"); g.Status == enum.GiftRefunded || g.Status == enum.GiftRefunding {
 		t.Fatalf("status = %s，不該走到退款", g.Status)
 	}
 }
 
 type alwaysConflictOnGiftCredit struct{ *giftWorld }
 
-func (a *alwaysConflictOnGiftCredit) Credit(ctx context.Context, m domain.Movement) (walletstore.CreditResult, error) {
+func (a *alwaysConflictOnGiftCredit) Credit(ctx context.Context, m domain.Movement) (repository.CreditResult, error) {
 	if m.SubType == domain.SubTypeGift {
-		return walletstore.CreditResult{}, walletstore.ErrConcurrentModification
+		return repository.CreditResult{}, repository.ErrConcurrentModification
 	}
 	return a.giftWorld.Credit(ctx, m)
 }

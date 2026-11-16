@@ -198,7 +198,7 @@ func newMovement(playerID int64, txType TxType, subType SubType, amount, unfreez
 		return Movement{}, fmt.Errorf("%w: %q 屬於 %s，不能用在 %s", ErrSubTypeDirectionMismatch, subType, want, txType)
 	}
 	// 對齊 Java 的 @PositiveOrZero：0 合法、負數不合法。
-	// ⚠️ 負的 unfreeze 會讓 store 那層的 frozen_amount **變大**，
+	// ⚠️ 負的 unfreeze 會讓 repository 那層的 frozen_amount **變大**，
 	// 於是可用餘額（balance - frozen_amount）憑空變小，症狀是後續下注拿到
 	// 「餘額不足」而餘額看起來明明夠。schema 的 CHECK 只擋負數，擋不住這個方向。
 	if unfreeze < 0 {

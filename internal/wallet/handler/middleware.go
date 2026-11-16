@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/apiprotocol"
+
 	"crypto/subtle"
 	"log/slog"
 	"runtime/debug"
@@ -60,7 +62,7 @@ func recovery(logger *slog.Logger) fiber.Handler {
 					"stack", string(debug.Stack()),
 				)
 				// 對齊 Java 的 handleGeneral：500 + 固定訊息，不外洩細節。
-				err = respondError(c, fiber.StatusInternalServerError, internalErrorMessage)
+				err = respondError(c, fiber.StatusInternalServerError, apiprotocol.InternalError)
 			}
 		}()
 		return c.Next()
@@ -88,7 +90,7 @@ func requireInternalSecret(logger *slog.Logger, secret string) fiber.Handler {
 				"remoteAddr", c.IP(),
 			)
 			// 訊息逐字對齊 Java，也刻意不說是「沒帶」還是「帶錯」。
-			return respondError(c, fiber.StatusUnauthorized, unauthorizedMessage)
+			return respondError(c, fiber.StatusUnauthorized, apiprotocol.Unauthorized)
 		}
 		return c.Next()
 	}

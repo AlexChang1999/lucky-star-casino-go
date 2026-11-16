@@ -132,13 +132,13 @@ func TestNewCredit(t *testing.T) {
 			name: "帶解凍", amount: 250, subType: SubTypeWin, unfreeze: 100,
 		},
 		{
-			// ⚠️ 這裡**不**檢查 unfreeze 是否超過目前凍結金額——那要等到 store
+			// ⚠️ 這裡**不**檢查 unfreeze 是否超過目前凍結金額——那要等到 repository
 			// 那層讀到真正的 frozen_amount 才知道，而且 Java 的做法是夾住不是拒絕。
-			name:   "解凍金額超過任何合理值仍然合法（夾住是 store 的事）",
+			name:   "解凍金額超過任何合理值仍然合法（夾住是 repository 的事）",
 			amount: 250, subType: SubTypeWin, unfreeze: 1 << 40,
 		},
 		{
-			// ⭐ 負的解凍會讓 store 那層的 frozen_amount **變大**，於是可用餘額
+			// ⭐ 負的解凍會讓 repository 那層的 frozen_amount **變大**，於是可用餘額
 			// 憑空變小，症狀是之後下注拿到「餘額不足」而餘額看起來明明夠。
 			// schema 的 CHECK (frozen_amount >= 0) 擋不住這個方向。
 			name: "解凍不可為負", amount: 250, subType: SubTypeWin, unfreeze: -1,
@@ -177,7 +177,7 @@ func TestNewCredit(t *testing.T) {
 // ⚠️ 走公開建構子時觸發不了（NewDebit 硬編 unfreeze=0），所以直接呼叫 newMovement。
 // 這正是「測試與被測程式同一個套件」的價值：不變式測得到，而不是只能靠註解宣稱。
 // 沒有這條，一個手工組出來的 Movement{Type: DEBIT, UnfreezeAmount: 500} 會在
-// store 那層被**靜靜忽略**——不會報錯，只會有一個沒被解凍的凍結金額。
+// repository 那層被**靜靜忽略**——不會報錯，只會有一個沒被解凍的凍結金額。
 func TestUnfreezeOnlyOnCredit(t *testing.T) {
 	_, err := newMovement(42, TxTypeDebit, SubTypeBet, 100, 500, "debit-with-unfreeze", "")
 	if !errors.Is(err, ErrUnfreezeNotAllowed) {

@@ -1,7 +1,7 @@
 // Package outbox 是 Transactional Outbox 的**投遞側**：把 wallet_outbox 裡的
 // PENDING 事件送進 Kafka、標成 SENT，並定期清掉保留期外的 SENT 列。
 //
-// 寫入側在 internal/wallet/store（appendOutbox，與帳務異動同一筆交易）。
+// 寫入側在 internal/wallet/repository（appendOutbox，與帳務異動同一筆交易）。
 // 兩側刻意分在不同套件，因為它們的失敗模式完全不同：
 //
 //	寫入側失敗 → 帳務跟著回滾，「錢動了但事件沒了」不可能發生
@@ -21,7 +21,7 @@ import (
 
 	"github.com/segmentio/kafka-go"
 
-	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
 )
 
 const (
@@ -154,7 +154,7 @@ func NewPublisher(writer *kafka.Writer, logger *slog.Logger) *Publisher {
 	return &Publisher{writer: writer, logger: logger}
 }
 
-// Publish 實作 store.PublishFunc：送出整批事件，回傳已 ack 的 id。
+// Publish 實作 repository.PublishFunc：送出整批事件，回傳已 ack 的 id。
 //
 // ⭐ 部分成功是**正常情況**而不是例外：一批事件會依 key 打散到多個 partition，
 // 其中一個 partition 的 leader 掛掉時，只有落在它身上的那些會失敗。
@@ -162,7 +162,7 @@ func NewPublisher(writer *kafka.Writer, logger *slog.Logger) *Publisher {
 // **索引對齊**的 error 切片（成功的位置是 nil）。
 // ⚠️ 把它當成「整批失敗」處理的話，已經送達的那些會維持 PENDING 並被重送，
 // 下游每次投遞失敗都會多吃一批重複事件。
-func (p *Publisher) Publish(ctx context.Context, events []store.PendingEvent) ([]int64, error) {
+func (p *Publisher) Publish(ctx context.Context, events []repository.PendingEvent) ([]int64, error) {
 	if len(events) == 0 {
 		return nil, nil
 	}
@@ -230,14 +230,14 @@ func (p *Publisher) Close() error {
 // messagesFor 把 outbox 的列翻譯成 Kafka 訊息。
 //
 // ⚠️ Payload **原封不動**轉成 bytes，不重新序列化。outbox 存的是帳務交易當下
-// 產生的那一份 JSON 字串（見 store.appendOutbox），中途解開再包回去會讓欄位順序、
+// 產生的那一份 JSON 字串（見 repository.appendOutbox），中途解開再包回去會讓欄位順序、
 // 空白、數字格式全部變成「Go 的 encoding/json 說了算」，而契約測試是逐位元組比對的。
-func messagesFor(events []store.PendingEvent) []kafka.Message {
+func messagesFor(events []repository.PendingEvent) []kafka.Message {
 	messages := make([]kafka.Message, len(events))
 	for i, e := range events {
 		var key []byte
 		if e.KafkaKey != nil {
-			// ⚠️ nil 與空 []byte 在 Kafka 不是同一件事（見 store.PendingEvent 的
+			// ⚠️ nil 與空 []byte 在 Kafka 不是同一件事（見 repository.PendingEvent 的
 			// 註解），所以這裡靠 *string 是否為 nil 來決定，而不是靠字串長度。
 			key = []byte(*e.KafkaKey)
 		}

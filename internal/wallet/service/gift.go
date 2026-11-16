@@ -7,8 +7,9 @@ import (
 	"time"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/model/enum"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/quota"
-	walletstore "github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
 )
 
 // 贈禮：兩步冪等 + 補償（docs/ADR-005）。
@@ -71,7 +72,7 @@ type GiftResult struct {
 	ReceiverBalanceAfter *int64
 	// Idempotent 為 true 代表這次呼叫沒有立新單，回的是既有那張單的現況。
 	Idempotent bool
-	Status     walletstore.GiftStatus
+	Status     enum.GiftStatus
 }
 
 // Gift 送出一筆贈禮。key 是呼叫端的冪等鍵：帶同一把鍵重送，得到的是同一筆贈禮的現況。
@@ -90,10 +91,10 @@ func (s *Service) Gift(ctx context.Context, senderID, receiverID, amount int64, 
 	// 非正整數的玩家 ID 不可能有錢包。擋在這裡而不是讓它走到 domain 的驗證，
 	// 是因為對外要回「錢包不存在」（Java 的行為），不是 500。
 	if senderID <= 0 {
-		return GiftResult{}, &Error{Code: CodeGiftSenderNotFound, Err: walletstore.ErrWalletNotFound}
+		return GiftResult{}, &Error{Code: CodeGiftSenderNotFound, Err: repository.ErrWalletNotFound}
 	}
 	if receiverID <= 0 {
-		return GiftResult{}, &Error{Code: CodeGiftReceiverNotFound, Err: walletstore.ErrWalletNotFound}
+		return GiftResult{}, &Error{Code: CodeGiftReceiverNotFound, Err: repository.ErrWalletNotFound}
 	}
 
 	// 冪等預檢排在額度之前：重送不可以再吃一次當日額度。
@@ -101,7 +102,7 @@ func (s *Service) Gift(ctx context.Context, senderID, receiverID, amount int64, 
 	switch {
 	case err == nil:
 		return s.replayGift(existing, senderID)
-	case !errors.Is(err, walletstore.ErrGiftNotFound):
+	case !errors.Is(err, repository.ErrGiftNotFound):
 		s.logger.Error("查詢贈禮狀態單失敗", "senderID", senderID, "idempotencyKey", key, "err", err)
 		return GiftResult{}, &Error{Code: CodeInternal, Err: err}
 	}
@@ -131,7 +132,7 @@ func (s *Service) Gift(ctx context.Context, senderID, receiverID, amount int64, 
 	g, err := s.gifts.InsertGift(ctx, key, senderID, receiverID, amt, s.now().Add(giftInFlightGrace))
 	if err != nil {
 		release()
-		if errors.Is(err, walletstore.ErrGiftDuplicateKey) {
+		if errors.Is(err, repository.ErrGiftDuplicateKey) {
 			// 同鍵的另一個請求剛好先立了單：這次什麼都沒做，回它的現況。
 			winner, werr := s.gifts.GiftByKey(ctx, key)
 			if werr != nil {
@@ -151,7 +152,7 @@ func (s *Service) Gift(ctx context.Context, senderID, receiverID, amount int64, 
 		return GiftResult{}, stepErr
 	}
 	switch g.Status {
-	case walletstore.GiftPending:
+	case enum.GiftPending:
 		// 扣款結果不明（例如連線斷在 commit 上）。額度**不回補**：這筆贈禮可能已經扣款，
 		// 背景會用同一把鍵確認並做完它。
 		if stepErr == nil {
@@ -159,7 +160,7 @@ func (s *Service) Gift(ctx context.Context, senderID, receiverID, amount int64, 
 			stepErr = &Error{Code: CodeInternal, Err: errGiftStuck}
 		}
 		return GiftResult{}, stepErr
-	case walletstore.GiftRefunded:
+	case enum.GiftRefunded:
 		return GiftResult{}, &Error{Code: CodeGiftRefunded, Err: errGiftRefunded}
 	default:
 		// COMPLETED，或錢已離開送出方、入帳 / 退款還在路上（背景接手）。
@@ -173,20 +174,20 @@ func (s *Service) Gift(ctx context.Context, senderID, receiverID, amount int64, 
 // 真正的防線是 debit 的條件 UPDATE，以及入帳失敗後的退款。
 // ⚠️ 餘額看的是**總餘額**，對齊 Java（`sender.getBalance() < amount`）。
 func (s *Service) precheckGift(ctx context.Context, senderID, receiverID, amount int64) *Error {
-	balance, err := s.store.Balance(ctx, senderID)
+	balance, err := s.repo.Balance(ctx, senderID)
 	switch {
-	case errors.Is(err, walletstore.ErrWalletNotFound):
+	case errors.Is(err, repository.ErrWalletNotFound):
 		return &Error{Code: CodeGiftSenderNotFound, Err: err}
 	case err != nil:
 		s.logger.Error("贈禮預檢讀取送出方餘額失敗", "senderID", senderID, "err", err)
 		return &Error{Code: CodeInternal, Err: err}
 	case balance < amount:
-		return &Error{Code: CodeInsufficientBalance, Err: walletstore.ErrInsufficientBalance}
+		return &Error{Code: CodeInsufficientBalance, Err: repository.ErrInsufficientBalance}
 	}
 
-	_, err = s.store.Balance(ctx, receiverID)
+	_, err = s.repo.Balance(ctx, receiverID)
 	switch {
-	case errors.Is(err, walletstore.ErrWalletNotFound):
+	case errors.Is(err, repository.ErrWalletNotFound):
 		return &Error{Code: CodeGiftReceiverNotFound, Err: err}
 	case err != nil:
 		s.logger.Error("贈禮預檢讀取接收方錢包失敗", "receiverID", receiverID, "err", err)
@@ -201,19 +202,19 @@ func (s *Service) precheckGift(ctx context.Context, senderID, receiverID, amount
 // 任何人帶同一把鍵都拿得到原贈禮的內容——包含原送出方的餘額。這裡只回給原送出方，
 // 其他人一律當成鍵衝突（記在 docs/ADR-005）。
 // 同一個送出方用同一把鍵改送別人或改金額，則照 Java 回原本那一筆。
-func (s *Service) replayGift(g walletstore.GiftTransfer, senderID int64) (GiftResult, error) {
+func (s *Service) replayGift(g repository.GiftTransfer, senderID int64) (GiftResult, error) {
 	if g.SenderID != senderID {
 		s.logger.Warn("贈禮冪等鍵屬於另一位送出方，拒絕重送",
 			"idempotencyKey", g.IdempotencyKey, "ownerID", g.SenderID, "callerID", senderID)
 		return GiftResult{}, &Error{Code: CodeGiftKeyConflict, Err: errGiftKeyOwnedByOther}
 	}
-	if g.Status == walletstore.GiftRefunded {
+	if g.Status == enum.GiftRefunded {
 		return GiftResult{}, &Error{Code: CodeGiftRefunded, Err: errGiftRefunded}
 	}
 	return giftResultOf(g, true), nil
 }
 
-func giftResultOf(g walletstore.GiftTransfer, idempotent bool) GiftResult {
+func giftResultOf(g repository.GiftTransfer, idempotent bool) GiftResult {
 	return GiftResult{
 		SenderID:             g.SenderID,
 		ReceiverID:           g.ReceiverID,
@@ -232,7 +233,7 @@ func giftResultOf(g walletstore.GiftTransfer, idempotent bool) GiftResult {
 // ⭐ 這是冪等鍵**唯一**的產生處，而且只吃狀態單上的欄位：請求與背景重試拿到的
 // 必定是同一把鍵（地雷 #4）。鍵的形狀與 referenceId 對齊 Java `GiftService` /
 // `GiftTransferService`；`:gift:refund` 是本專案新增的第三把。
-func giftMovements(g walletstore.GiftTransfer) (debit, credit, refund domain.Movement, err error) {
+func giftMovements(g repository.GiftTransfer) (debit, credit, refund domain.Movement, err error) {
 	amt := domain.Amount(g.Amount)
 	debit, err = domain.NewGiftDebit(g.SenderID, amt, g.IdempotencyKey+":gift:debit", fmt.Sprintf("gift-to:%d", g.ReceiverID))
 	if err != nil {
@@ -252,7 +253,7 @@ func giftMovements(g walletstore.GiftTransfer) (debit, credit, refund domain.Mov
 //   - g：推進後的狀態單。
 //   - deleted：true 代表扣款被明確拒絕、狀態單已刪（什麼都沒動）。
 //   - err：讓它停下來的那一步的錯誤（已在起點記過日誌）。走到終態時為 nil。
-func (s *Service) advanceGift(ctx context.Context, g walletstore.GiftTransfer) (_ walletstore.GiftTransfer, deleted bool, _ error) {
+func (s *Service) advanceGift(ctx context.Context, g repository.GiftTransfer) (_ repository.GiftTransfer, deleted bool, _ error) {
 	debit, credit, refund, err := giftMovements(g)
 	if err != nil {
 		s.logger.Error("贈禮狀態單組不出合法的帳務意圖（資料錯誤）", "giftID", g.ID, "err", err)
@@ -265,11 +266,11 @@ func (s *Service) advanceGift(ctx context.Context, g walletstore.GiftTransfer) (
 			stepErr error // 這一步的錯誤；非 nil 就停
 		)
 		switch g.Status {
-		case walletstore.GiftPending:
+		case enum.GiftPending:
 			g, moved, deleted, stepErr = s.giftDebitStep(ctx, g, debit)
-		case walletstore.GiftDebited:
+		case enum.GiftDebited:
 			g, moved, stepErr = s.giftCreditStep(ctx, g, credit)
-		case walletstore.GiftRefunding:
+		case enum.GiftRefunding:
 			g, moved, stepErr = s.giftRefundStep(ctx, g, refund)
 		default:
 			return g, false, nil // COMPLETED / REFUNDED
@@ -283,7 +284,7 @@ func (s *Service) advanceGift(ctx context.Context, g walletstore.GiftTransfer) (
 		// 條件式轉移沒改到任何一列：別人（另一個請求或另一個副本）已經先轉走了。
 		// 重讀之後照它現在的狀態繼續。
 		fresh, rerr := s.gifts.GiftByID(ctx, g.ID)
-		if errors.Is(rerr, walletstore.ErrGiftNotFound) {
+		if errors.Is(rerr, repository.ErrGiftNotFound) {
 			return g, true, &Error{Code: CodeInternal, Err: rerr}
 		}
 		if rerr != nil {
@@ -297,7 +298,7 @@ func (s *Service) advanceGift(ctx context.Context, g walletstore.GiftTransfer) (
 }
 
 // giftDebitStep：PENDING → DEBITED。
-func (s *Service) giftDebitStep(ctx context.Context, g walletstore.GiftTransfer, debit domain.Movement) (_ walletstore.GiftTransfer, moved, deleted bool, _ error) {
+func (s *Service) giftDebitStep(ctx context.Context, g repository.GiftTransfer, debit domain.Movement) (_ repository.GiftTransfer, moved, deleted bool, _ error) {
 	r, err := s.Debit(ctx, debit)
 	if err == nil && giftKeyCollision(r.Idempotent, r.PlayerID, r.Amount, debit) {
 		err = s.giftCollision(debit)
@@ -332,7 +333,7 @@ func (s *Service) giftDebitStep(ctx context.Context, g walletstore.GiftTransfer,
 	if !ok {
 		return g, false, false, nil
 	}
-	g.Status = walletstore.GiftDebited
+	g.Status = enum.GiftDebited
 	g.Attempts = 0
 	g.DebitTransactionID = &r.TransactionID
 	g.SenderBalanceAfter = &r.BalanceAfter
@@ -340,7 +341,7 @@ func (s *Service) giftDebitStep(ctx context.Context, g walletstore.GiftTransfer,
 }
 
 // giftCreditStep：DEBITED → COMPLETED，失敗滿次數（或接收方錢包不存在）→ REFUNDING。
-func (s *Service) giftCreditStep(ctx context.Context, g walletstore.GiftTransfer, credit domain.Movement) (_ walletstore.GiftTransfer, moved bool, _ error) {
+func (s *Service) giftCreditStep(ctx context.Context, g repository.GiftTransfer, credit domain.Movement) (_ repository.GiftTransfer, moved bool, _ error) {
 	r, err := s.Credit(ctx, credit)
 	if err == nil && giftKeyCollision(r.Idempotent, r.PlayerID, r.Amount, credit) {
 		err = s.giftCollision(credit)
@@ -383,7 +384,7 @@ func (s *Service) giftCreditStep(ctx context.Context, g walletstore.GiftTransfer
 		s.logger.Warn("贈禮入帳放棄，改為退款給送出方",
 			"giftID", g.ID, "senderID", g.SenderID, "receiverID", g.ReceiverID,
 			"amount", g.Amount, "attempts", attempts, "err", err)
-		g.Status = walletstore.GiftRefunding
+		g.Status = enum.GiftRefunding
 		g.Attempts = 0
 		return g, true, nil
 	}
@@ -397,7 +398,7 @@ func (s *Service) giftCreditStep(ctx context.Context, g walletstore.GiftTransfer
 	if !ok {
 		return g, false, nil
 	}
-	g.Status = walletstore.GiftCompleted
+	g.Status = enum.GiftCompleted
 	g.CreditTransactionID = &r.TransactionID
 	g.ReceiverBalanceAfter = &r.BalanceAfter
 	return g, true, nil
@@ -408,7 +409,7 @@ func (s *Service) giftCreditStep(ctx context.Context, g walletstore.GiftTransfer
 // ⚠️ 退款成功後**不回補當日額度**：退款可能發生在隔天，而 ReleaseGiftQuota 用的是
 // 「現在」的日期，回補會扣到隔天的計數上。少回補只會讓當天的額度偏嚴、午夜自動歸零
 // （與 Java 對「多計」的取捨相同）。
-func (s *Service) giftRefundStep(ctx context.Context, g walletstore.GiftTransfer, refund domain.Movement) (_ walletstore.GiftTransfer, moved bool, _ error) {
+func (s *Service) giftRefundStep(ctx context.Context, g repository.GiftTransfer, refund domain.Movement) (_ repository.GiftTransfer, moved bool, _ error) {
 	r, err := s.Credit(ctx, refund)
 	if err == nil && giftKeyCollision(r.Idempotent, r.PlayerID, r.Amount, refund) {
 		err = s.giftCollision(refund)
@@ -427,13 +428,13 @@ func (s *Service) giftRefundStep(ctx context.Context, g walletstore.GiftTransfer
 		return g, false, nil
 	}
 	s.logger.Info("贈禮已退回送出方", "giftID", g.ID, "senderID", g.SenderID, "amount", g.Amount)
-	g.Status = walletstore.GiftRefunded
+	g.Status = enum.GiftRefunded
 	g.SenderBalanceAfter = &r.BalanceAfter
 	return g, true, nil
 }
 
 // scheduleGiftRetry 給「沒有次數上限」的兩步（確認扣款、退款）記一次失敗並排下一次。
-func (s *Service) scheduleGiftRetry(ctx context.Context, g *walletstore.GiftTransfer, cause error) {
+func (s *Service) scheduleGiftRetry(ctx context.Context, g *repository.GiftTransfer, cause error) {
 	attempts := g.Attempts + 1
 	if _, err := s.gifts.ScheduleGiftRetry(ctx, g.ID, g.Status, attempts, s.now().Add(giftBackoff(attempts)), cause.Error()); err != nil {
 		s.logger.Error("排定贈禮重試失敗", "giftID", g.ID, "status", g.Status, "err", err)
@@ -444,7 +445,7 @@ func (s *Service) scheduleGiftRetry(ctx context.Context, g *walletstore.GiftTran
 
 // giftKeyCollision 回答「這次冪等命中的流水，是不是其實不屬於這筆贈禮」。
 //
-// 冪等命中時 store 回的是**原交易**的玩家與金額。贈禮的鍵由狀態單衍生，正常情況下
+// 冪等命中時 repository 回的是**原交易**的玩家與金額。贈禮的鍵由狀態單衍生，正常情況下
 // 原交易就是自己之前寫的那一筆；但若那把鍵先被別的流水占用（鍵的命名空間撞了），
 // 把它當成功會讓狀態單走到 COMPLETED 而錢根本沒進到接收方。
 func giftKeyCollision(idempotent bool, playerID, amount int64, want domain.Movement) bool {

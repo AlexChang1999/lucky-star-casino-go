@@ -1,4 +1,4 @@
-package store
+package repository
 
 import (
 	"context"
@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/model/enum"
 )
 
 // 贈禮狀態單（gift_transfers）的存取。設計見 docs/ADR-005 與 migration 00003。
@@ -16,17 +17,6 @@ import (
 // 就代表別人（另一個請求、另一個副本的背景重試）已經先轉走了。
 // 而真正動錢的三步各自帶固定冪等鍵，兩邊同時做同一步只會有一邊真的記帳。
 // 所以這裡不需要 `FOR UPDATE`，也就不會踩到地雷 #37 的 gap lock。
-
-// GiftStatus 是贈禮狀態單的狀態，對應 gift_transfers.status 的 CHECK 約束。
-type GiftStatus string
-
-const (
-	GiftPending   GiftStatus = "PENDING"   // 已立單，尚未確認扣款
-	GiftDebited   GiftStatus = "DEBITED"   // 送出方已扣款，等待入帳
-	GiftCompleted GiftStatus = "COMPLETED" // 接收方已入帳（終態）
-	GiftRefunding GiftStatus = "REFUNDING" // 入帳放棄，正在退款給送出方
-	GiftRefunded  GiftStatus = "REFUNDED"  // 已退款（終態）
-)
 
 var (
 	// ErrGiftDuplicateKey 表示同一把冪等鍵的狀態單已經存在（1062）。
@@ -40,18 +30,18 @@ var (
 // 四個指標欄位在對應步驟完成前是 NULL（地雷 #33）：用 int64 的話「還沒入帳」
 // 會靜靜變成「入帳交易編號 0」。
 type GiftTransfer struct {
-	ID                   int64      `gorm:"column:id;primaryKey"`
-	IdempotencyKey       string     `gorm:"column:idempotency_key"`
-	SenderID             int64      `gorm:"column:sender_id"`
-	ReceiverID           int64      `gorm:"column:receiver_id"`
-	Amount               int64      `gorm:"column:amount"`
-	Status               GiftStatus `gorm:"column:status"`
-	Attempts             int        `gorm:"column:attempts"`
-	NextAttemptAt        *time.Time `gorm:"column:next_attempt_at"`
-	DebitTransactionID   *int64     `gorm:"column:debit_transaction_id"`
-	CreditTransactionID  *int64     `gorm:"column:credit_transaction_id"`
-	SenderBalanceAfter   *int64     `gorm:"column:sender_balance_after"`
-	ReceiverBalanceAfter *int64     `gorm:"column:receiver_balance_after"`
+	ID                   int64           `gorm:"column:id;primaryKey"`
+	IdempotencyKey       string          `gorm:"column:idempotency_key"`
+	SenderID             int64           `gorm:"column:sender_id"`
+	ReceiverID           int64           `gorm:"column:receiver_id"`
+	Amount               int64           `gorm:"column:amount"`
+	Status               enum.GiftStatus `gorm:"column:status"`
+	Attempts             int             `gorm:"column:attempts"`
+	NextAttemptAt        *time.Time      `gorm:"column:next_attempt_at"`
+	DebitTransactionID   *int64          `gorm:"column:debit_transaction_id"`
+	CreditTransactionID  *int64          `gorm:"column:credit_transaction_id"`
+	SenderBalanceAfter   *int64          `gorm:"column:sender_balance_after"`
+	ReceiverBalanceAfter *int64          `gorm:"column:receiver_balance_after"`
 }
 
 // TableName 讓 GORM 對到 gift_transfers。
@@ -169,7 +159,7 @@ func (r *Repository) MarkGiftRefunded(ctx context.Context, id, senderBalanceAfte
 
 // ScheduleGiftRetry 記下這個階段又失敗一次，並排定下一次重試時間。
 // status 是呼叫端看到的狀態；已經被別人轉走時不做任何事並回 false。
-func (r *Repository) ScheduleGiftRetry(ctx context.Context, id int64, status GiftStatus, attempts int, nextAttemptAt time.Time, lastErr string) (bool, error) {
+func (r *Repository) ScheduleGiftRetry(ctx context.Context, id int64, status enum.GiftStatus, attempts int, nextAttemptAt time.Time, lastErr string) (bool, error) {
 	return r.giftTransition(ctx, scheduleGiftRetry, attempts, nextAttemptAt.UTC(), truncateGiftError(lastErr), id, string(status))
 }
 

@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/config"
-	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/repository"
 )
 
 // roundTimeout 是**單輪**投遞的總預算（撈取 + 送出 + 標記）。
@@ -49,15 +49,15 @@ const (
 	outcomeStalled                      // 撈到了卻一則都沒送出，或撈取本身就失敗
 )
 
-// eventStore 是 poller 需要的儲存能力。
+// eventRepository 是 poller 需要的儲存能力。
 //
-// ⭐ 介面定義在**消費端**（CLAUDE.md §2）：`*store.Repository` 完全不知道
+// ⭐ 介面定義在**消費端**（CLAUDE.md §2）：`*repository.Repository` 完全不知道
 // 這個介面存在，它只是剛好有這個方法。這與 Java 的
 // 「先寫 WalletOutboxRepository 介面、再寫 Impl」是相反的方向——
 // 好處很具體：這裡只需要一個方法，測試的假物件就只要一個方法，
-// 而 store.Repository 之後長到二十個方法也不會影響這裡。
-type eventStore interface {
-	PublishPending(ctx context.Context, batchSize int, publish store.PublishFunc) (store.PublishStats, error)
+// 而 repository.Repository 之後長到二十個方法也不會影響這裡。
+type eventRepository interface {
+	PublishPending(ctx context.Context, batchSize int, publish repository.PublishFunc) (repository.PublishStats, error)
 }
 
 // Poller 定時把 wallet_outbox 的 PENDING 事件投遞出去。
@@ -66,8 +66,8 @@ type eventStore interface {
 // 差別只在 Go 沒有 scheduler 容器——一個 goroutine 加一個 timer 就是全部，
 // 而且「它在哪個執行緒上跑、由誰啟動、什麼時候停」在 main.go 裡一眼看得完。
 type Poller struct {
-	store     eventStore
-	publish   store.PublishFunc
+	repo      eventRepository
+	publish   repository.PublishFunc
 	interval  time.Duration
 	batchSize int
 	logger    *slog.Logger
@@ -78,12 +78,12 @@ type Poller struct {
 // ⚠️ publish 是一個**函式**而不是 *Publisher：poller 的職責是「多久跑一次、
 // 一次撈多少、錯了怎麼記」，它完全不需要知道下游是 Kafka。
 // 這也讓測試不必碰 Kafka——傳一個回傳固定結果的函式進來就好。
-func NewPoller(s eventStore, publish store.PublishFunc, cfg config.Outbox, logger *slog.Logger) *Poller {
+func NewPoller(s eventRepository, publish repository.PublishFunc, cfg config.Outbox, logger *slog.Logger) *Poller {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Poller{
-		store:     s,
+		repo:      s,
 		publish:   publish,
 		interval:  cfg.PollInterval,
 		batchSize: cfg.BatchSize,
@@ -160,7 +160,7 @@ func (p *Poller) runOnce(ctx context.Context) roundOutcome {
 	roundCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), roundTimeout)
 	defer cancel()
 
-	stats, err := p.store.PublishPending(roundCtx, p.batchSize, p.publish)
+	stats, err := p.repo.PublishPending(roundCtx, p.batchSize, p.publish)
 	if err != nil {
 		// ⚠️ 這裡**不區分**「DB 失敗」與「部分投遞失敗」，因為兩者的處置相同：
 		// 記下來、等下一輪。真正的差別（交易有沒有提交）已經反映在 stats 上。
@@ -211,7 +211,7 @@ func (p *Poller) runOnce(ctx context.Context) roundOutcome {
 // ⚠️ 判準是「**這一輪有沒有任何一則真的送出去**」，不是「有沒有 error」：
 // 部分失敗（一批打散到多個 partition，其中一個掛了）帶著 error 但 Kafka 是活的，
 // 那時退避只會拖慢其餘正常的事件。
-func classifyRound(stats store.PublishStats, err error) roundOutcome {
+func classifyRound(stats repository.PublishStats, err error) roundOutcome {
 	switch {
 	case stats.Fetched == 0:
 		// 撈不到東西有兩種：真的沒事做（常態），或撈取語句本身就失敗

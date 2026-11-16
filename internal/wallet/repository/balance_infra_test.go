@@ -1,6 +1,6 @@
 //go:build infra
 
-package store
+package repository
 
 import (
 	"errors"

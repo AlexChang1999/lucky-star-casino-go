@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/apiprotocol"
+
 	"errors"
 	"log/slog"
 
@@ -54,6 +56,6 @@ func errorHandler(logger *slog.Logger) fiber.ErrorHandler {
 			return respondError(c, fe.Code, fe.Message)
 		}
 		logger.Error("未處理的錯誤", "path", c.Path(), "err", err)
-		return respondError(c, fiber.StatusInternalServerError, internalErrorMessage)
+		return respondError(c, fiber.StatusInternalServerError, apiprotocol.InternalError)
 	}
 }

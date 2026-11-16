@@ -1,12 +1,14 @@
 //go:build infra
 
-package store
+package repository
 
 import (
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/model/enum"
 )
 
 var giftNow = time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
@@ -23,7 +25,7 @@ func mustInsertGift(t *testing.T, e *testEnv, key string, next time.Time) GiftTr
 func TestGiftInsertAndLookup(t *testing.T) {
 	e := newTestEnv(t)
 	g := mustInsertGift(t, e, "k1", giftNow)
-	if g.Status != GiftPending || g.Attempts != 0 || g.Amount != 300 {
+	if g.Status != enum.GiftPending || g.Attempts != 0 || g.Amount != 300 {
 		t.Fatalf("新單 = %+v", g)
 	}
 	// 四個指標欄位在對應步驟完成前是 NULL，不是 0（地雷 #33）。
@@ -80,7 +82,7 @@ func TestGiftTransitionsAreConditional(t *testing.T) {
 		t.Fatal("同一個轉移做第二次應回 false（別人已經轉走了）")
 	}
 	got, _ := e.repo.GiftByID(e.ctx, g.ID)
-	if got.Status != GiftDebited || got.DebitTransactionID == nil || *got.DebitTransactionID != 10 ||
+	if got.Status != enum.GiftDebited || got.DebitTransactionID == nil || *got.DebitTransactionID != 10 ||
 		got.SenderBalanceAfter == nil || *got.SenderBalanceAfter != 700 {
 		t.Fatalf("DEBITED 後的單 = %+v", got)
 	}
@@ -89,7 +91,7 @@ func TestGiftTransitionsAreConditional(t *testing.T) {
 		t.Fatalf("MarkGiftCompleted = (%v, %v)", ok, err)
 	}
 	got, _ = e.repo.GiftByID(e.ctx, g.ID)
-	if got.Status != GiftCompleted || got.NextAttemptAt != nil || got.ReceiverBalanceAfter == nil || *got.ReceiverBalanceAfter != 350 {
+	if got.Status != enum.GiftCompleted || got.NextAttemptAt != nil || got.ReceiverBalanceAfter == nil || *got.ReceiverBalanceAfter != 350 {
 		t.Fatalf("COMPLETED 後的單 = %+v", got)
 	}
 	// 終態不能再被退款。
@@ -112,7 +114,7 @@ func TestGiftRefundPath(t *testing.T) {
 		t.Fatal("MarkGiftRefunded")
 	}
 	got, _ := e.repo.GiftByID(e.ctx, g.ID)
-	if got.Status != GiftRefunded || got.NextAttemptAt != nil || got.SenderBalanceAfter == nil || *got.SenderBalanceAfter != 1000 {
+	if got.Status != enum.GiftRefunded || got.NextAttemptAt != nil || got.SenderBalanceAfter == nil || *got.SenderBalanceAfter != 1000 {
 		t.Fatalf("REFUNDED 後的單 = %+v", got)
 	}
 }
@@ -168,7 +170,7 @@ func TestGiftScheduleRetryRespectsStatus(t *testing.T) {
 	g := mustInsertGift(t, e, "k1", giftNow)
 	next := giftNow.Add(time.Minute)
 
-	if ok, err := e.repo.ScheduleGiftRetry(e.ctx, g.ID, GiftPending, 3, next, "boom"); err != nil || !ok {
+	if ok, err := e.repo.ScheduleGiftRetry(e.ctx, g.ID, enum.GiftPending, 3, next, "boom"); err != nil || !ok {
 		t.Fatalf("ScheduleGiftRetry = (%v, %v)", ok, err)
 	}
 	got, _ := e.repo.GiftByID(e.ctx, g.ID)
@@ -176,7 +178,7 @@ func TestGiftScheduleRetryRespectsStatus(t *testing.T) {
 		t.Fatalf("排程後 = %+v", got)
 	}
 	// 呼叫端看到的狀態已過期（別人轉走了）：不可動 attempts。
-	if ok, _ := e.repo.ScheduleGiftRetry(e.ctx, g.ID, GiftDebited, 9, next, "boom"); ok {
+	if ok, _ := e.repo.ScheduleGiftRetry(e.ctx, g.ID, enum.GiftDebited, 9, next, "boom"); ok {
 		t.Fatal("狀態對不上時不該更新")
 	}
 	if got, _ := e.repo.GiftByID(e.ctx, g.ID); got.Attempts != 3 {
@@ -189,7 +191,7 @@ func TestGiftLongChineseErrorIsTruncatedSafely(t *testing.T) {
 	e := newTestEnv(t)
 	g := mustInsertGift(t, e, "k1", giftNow)
 	msg := strings.Repeat("錯", 400)
-	if ok, err := e.repo.ScheduleGiftRetry(e.ctx, g.ID, GiftPending, 1, giftNow, msg); err != nil || !ok {
+	if ok, err := e.repo.ScheduleGiftRetry(e.ctx, g.ID, enum.GiftPending, 1, giftNow, msg); err != nil || !ok {
 		t.Fatalf("長中文訊息應被安全截斷: (%v, %v)", ok, err)
 	}
 }

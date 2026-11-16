@@ -34,8 +34,8 @@ const (
 // creator 是這個 handler 需要的 repo 子集合。
 //
 // ⭐ 介面定義在消費端（CLAUDE.md §2），跟 internal/platform/kafka 的
-// messageReader 是同一個模式：store 套件不知道這個介面存在，只是剛好有這
-// 兩個方法。好處是測試的假物件只要實作兩個方法，不必引入整個 *store.Repository。
+// messageReader 是同一個模式：repository 套件不知道這個介面存在，只是剛好有這
+// 兩個方法。好處是測試的假物件只要實作兩個方法，不必引入整個 *repository.Repository。
 type creator interface {
 	CreateWallet(ctx context.Context, playerID int64) error
 	CreateDiamondWallet(ctx context.Context, playerID int64) error

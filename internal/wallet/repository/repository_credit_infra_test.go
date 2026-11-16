@@ -5,7 +5,7 @@
 // ⚠️ 為什麼另開一檔而不是接在 repository_infra_test.go 後面：那一檔已經是
 // debit 的完整證據鏈，而 credit 與 debit **形狀不同**（讀改寫 + 樂觀鎖 vs
 // 條件 UPDATE）。分檔讓「哪些斷言屬於哪一種形狀」一眼看得出來。
-package store
+package repository
 
 import (
 	"errors"
