@@ -24,7 +24,7 @@ linters:
   default: standard
   enable:
     # ⭐ errorlint：抓 `err == ErrX` 與 `err.(*MyErr)` 這種不穿透 `%w` 的比較。
-    # 本專案到處在包裝錯誤（store → service → httpapi），漏一個 errors.Is
+    # 本專案到處在包裝錯誤（store → service → handler），漏一個 errors.Is
     # 的症狀是「1062 沒被辨識成冪等命中」——帳務直接錯，而且沒有錯誤訊息。
     - errorlint
     # ⭐ rowserrcheck / sqlclosecheck：`rows.Err()` 沒檢查會讓「查到一半連線斷掉」

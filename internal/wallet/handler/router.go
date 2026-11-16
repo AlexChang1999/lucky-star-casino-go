@@ -38,6 +38,7 @@ func NewApp(h *Handler, internalSecret string, cfg config.HTTPServer) (*fiber.Ap
 	// ⚠️ 具體路徑必須排在 catch-all 之前（AGENTS.md 地雷 #13）。目前沒有 catch-all。
 	app.Get("/healthz", h.Health)
 	app.Post("/internal/wallet/debit", h.Debit)
+	app.Post("/internal/wallet/credit", h.Credit)
 
 	return app, nil
 }

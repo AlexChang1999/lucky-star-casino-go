@@ -20,6 +20,9 @@ type fakeService struct {
 	debitResult service.DebitResult
 	debitErr    error
 
+	creditResult service.CreditResult
+	creditErr    error
+
 	calls    int
 	received domain.Movement
 }
@@ -28,6 +31,12 @@ func (f *fakeService) Debit(_ context.Context, m domain.Movement) (service.Debit
 	f.calls++
 	f.received = m
 	return f.debitResult, f.debitErr
+}
+
+func (f *fakeService) Credit(_ context.Context, m domain.Movement) (service.CreditResult, error) {
+	f.calls++
+	f.received = m
+	return f.creditResult, f.creditErr
 }
 
 var goodSecret = testSecret

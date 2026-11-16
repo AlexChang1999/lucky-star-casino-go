@@ -15,6 +15,8 @@ import (
 type fakeStore struct {
 	debitResult walletstore.DebitResult
 	debitErr    error
+
+	creditResult walletstore.CreditResult
 }
 
 func (f *fakeStore) Debit(context.Context, domain.Movement) (walletstore.DebitResult, error) {
@@ -22,7 +24,7 @@ func (f *fakeStore) Debit(context.Context, domain.Movement) (walletstore.DebitRe
 }
 
 func (f *fakeStore) Credit(context.Context, domain.Movement) (walletstore.CreditResult, error) {
-	return walletstore.CreditResult{}, nil
+	return f.creditResult, nil
 }
 
 func newTestService(st Store) *Service {
@@ -72,5 +74,31 @@ func TestDebitResultComesFromStore(t *testing.T) {
 	want := DebitResult{TransactionID: 7, PlayerID: 99, Amount: 50, BalanceBefore: 1000, BalanceAfter: 950, Idempotent: true}
 	if got != want {
 		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+// TestCreditFrozenAfterKeepsNil 守地雷 #33：store 回 nil（冪等命中）時，service 不可把它
+// 變成指向 0 的指標——0 是合法的凍結金額，null 才是「沒有這個資訊」。
+func TestCreditFrozenAfterKeepsNil(t *testing.T) {
+	frozen := domain.Amount(250)
+	tests := []struct {
+		name string
+		in   *domain.Amount
+		want *int64
+	}{
+		{"nil 維持 nil", nil, nil},
+		{"有值就帶值", &frozen, func() *int64 { v := int64(250); return &v }()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestService(&fakeStore{creditResult: walletstore.CreditResult{FrozenAfter: tt.in}})
+			got, err := s.Credit(context.Background(), domain.Movement{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (got.FrozenAfter == nil) != (tt.want == nil) || (tt.want != nil && *got.FrozenAfter != *tt.want) {
+				t.Errorf("FrozenAfter = %v, want %v", got.FrozenAfter, tt.want)
+			}
+		})
 	}
 }

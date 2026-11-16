@@ -15,21 +15,23 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/gofiber/fiber/v3"
+
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/config"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/kafka"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/migrate"
 	platformstore "github.com/AlexChang1999/lucky-star-casino-go/internal/platform/store"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/domain"
-	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/httpapi"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/handler"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/memberconsume"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/outbox"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/service"
 	walletstore "github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
 )
 
@@ -120,8 +122,14 @@ func run() error {
 
 	// ── 組裝 ────────────────────────────────────────────────────────────
 	// 一路傳值下去，沒有容器、沒有反射、沒有 init()。
+	// 依賴方向只往下：handler → service → store（docs/ADR-004）。
 	repo := walletstore.NewRepository(db, logger)
-	handler, err := httpapi.New(repo, logger, walletCfg.InternalSecret)
+	walletSvc := service.New(repo, logger)
+	walletHandler, err := handler.New(walletSvc, logger)
+	if err != nil {
+		return err
+	}
+	app, err := handler.NewApp(walletHandler, walletCfg.InternalSecret, walletCfg.HTTP)
 	if err != nil {
 		return err
 	}
@@ -185,57 +193,45 @@ func run() error {
 		}
 	}()
 
-	return serve(ctx, logger, walletCfg.HTTP, handler)
+	return serve(ctx, logger, walletCfg.HTTP, app)
 }
 
-// serve 啟動 HTTP 伺服器並在收到關機訊號時優雅收工。
-func serve(ctx context.Context, logger *slog.Logger, cfg config.HTTPServer, handler http.Handler) error {
-	srv := &http.Server{
-		Addr:    cfg.Addr(),
-		Handler: handler,
-		// ⚠️ 四個逾時全部顯式設定。`http.Server` 的零值是「永不逾時」，
-		// 少設任何一個都等於留一條可以被慢速連線佔住的路（見 config.HTTPServer）。
-		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
-		ReadTimeout:       cfg.ReadTimeout,
-		WriteTimeout:      cfg.WriteTimeout,
-		IdleTimeout:       cfg.IdleTimeout,
-		// net/http 內部的錯誤（例如 TLS handshake 失敗）預設走 log 標準庫直接
-		// 印到 stderr，格式與其他日誌不同。轉接到 slog 讓輸出只有一種形狀。
-		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError),
-	}
-
+// serve 啟動 Fiber 伺服器並在收到關機訊號時優雅收工。
+func serve(ctx context.Context, logger *slog.Logger, cfg config.HTTPServer, app *fiber.App) error {
 	serveErr := make(chan error, 1)
 	go func() {
-		logger.Info("HTTP 伺服器開始接受連線", "addr", srv.Addr)
-		err := srv.ListenAndServe()
-		if errors.Is(err, http.ErrServerClosed) {
-			// 這是 Shutdown 造成的正常結束，不是錯誤。
-			err = nil
-		}
-		serveErr <- err
+		logger.Info("HTTP 伺服器開始接受連線", "addr", cfg.Addr())
+		// ⚠️ ListenerNetwork 明寫 tcp：Fiber 預設是 tcp4（只綁 IPv4），與 net/http 的
+		// 預設（雙堆疊）不同，於是「埠已被占用」的偵測行為在不同平台上會不一樣。
+		// 啟動橫幅關掉：它往 stdout 印純文字，混進 JSON 日誌會讓收集器只解得開一半。
+		serveErr <- app.Listen(cfg.Addr(), fiber.ListenConfig{
+			ListenerNetwork:       fiber.NetworkTCP,
+			DisableStartupMessage: true,
+		})
 	}()
 
 	select {
 	case err := <-serveErr:
+		// Listen 在 Shutdown 之前返回，一律是異常（例如埠被占用）。
 		if err != nil {
 			return fmt.Errorf("HTTP 伺服器意外結束: %w", err)
 		}
-		return nil
+		return errors.New("HTTP 伺服器在收到關機訊號前就結束了")
 	case <-ctx.Done():
 		logger.Info("收到關機訊號，開始優雅關機")
 	}
 
-	// ⚠️ context.WithoutCancel：ctx 在這一刻**已經被取消了**（那正是我們走到
-	// 這裡的原因）。直接拿它去 WithTimeout，得到的 context 一出生就是 done，
-	// Shutdown 會立刻放棄、把還在跑的請求硬斷掉——優雅關機變成不優雅關機，
-	// 而且完全沒有錯誤訊息。與 Kafka 收工時 commit offset 是同一個坑（地雷 #20）。
+	// ⚠️ context.WithoutCancel：ctx 在這一刻**已經被取消了**（那正是我們走到這裡的原因）。
+	// 直接拿它去 WithTimeout，得到的 context 一出生就是 done，Shutdown 會立刻放棄、
+	// 把還在跑的請求硬斷掉——優雅關機變成不優雅關機，而且完全沒有錯誤訊息。
+	// 與 Kafka 收工時 commit offset 是同一個坑（地雷 #20）。
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.ShutdownTimeout)
 	defer cancel()
 
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	if err := app.ShutdownWithContext(shutdownCtx); err != nil {
 		return fmt.Errorf("優雅關機逾時（%s），仍有請求未完成: %w", cfg.ShutdownTimeout, err)
 	}
-	// Shutdown 回來之後 ListenAndServe 那個 goroutine 一定已經返回，收掉它的結果，
+	// Shutdown 回來之後 Listen 那個 goroutine 一定已經返回，收掉它的結果，
 	// 順便讓 -race 看得出這裡沒有洩漏的 goroutine。
 	if err := <-serveErr; err != nil {
 		return fmt.Errorf("HTTP 伺服器結束時回報錯誤: %w", err)

@@ -36,6 +36,8 @@ const (
 	msgNotBlank = "must not be blank"
 	msgPositive = "must be greater than 0"
 	msgSize100  = "size must be between 0 and 100"
+
+	msgPositiveOrZero = "must be greater than or equal to 0"
 )
 
 // endpoint 帶著端點唯一不同的東西：subType 的 @Pattern 白名單訊息。
@@ -47,7 +49,15 @@ type endpoint struct {
 	subTypeMessage string
 }
 
-var debitEndpoint = endpoint{subTypeMessage: "subType must be one of BET/SHOP_PURCHASE"}
+var (
+	debitEndpoint = endpoint{
+		subTypeMessage: "subType must be one of BET/SHOP_PURCHASE",
+	}
+	creditEndpoint = endpoint{
+		subTypeMessage: "subType must be one of WIN/CHECKIN/TASK/GIFT/GM_REWARD/" +
+			"BANKRUPTCY_AID/DIAMOND_EXCHANGE/TOPUP/CASHBACK/REFUND/MONTHLY_REWARD",
+	}
+)
 
 // validationError 把 domain 的 sentinel 翻譯成 Java 的欄位訊息。
 //
@@ -70,8 +80,10 @@ func (e endpoint) validationError(err error) error {
 		return fieldError{field: "idempotencyKey", message: msgNotBlank}
 	case errors.Is(err, domain.ErrIdempotencyKeyTooLong):
 		return fieldError{field: "idempotencyKey", message: msgSize100}
+	case errors.Is(err, domain.ErrInvalidUnfreezeAmount):
+		return fieldError{field: "unfreezeAmount", message: msgPositiveOrZero}
 	default:
-		// domain.ErrUnknownTxType 等從這裡走不到（NewDebit 硬編了方向）。
+		// domain.ErrUnknownTxType、ErrUnfreezeNotAllowed 等從這裡走不到（NewDebit / NewCredit 硬編了方向與 unfreeze）。
 		// 真的出現代表程式有 bug 而不是請求有問題 → 原樣往上丟，落到 500。
 		return err
 	}
