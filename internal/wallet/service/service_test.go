@@ -17,18 +17,28 @@ type fakeStore struct {
 	debitErr    error
 
 	creditResult walletstore.CreditResult
+	creditErr    error
+	gotCredits   []domain.Movement
+
+	balance    int64
+	balanceErr error
+}
+
+func (f *fakeStore) Balance(context.Context, int64) (int64, error) {
+	return f.balance, f.balanceErr
 }
 
 func (f *fakeStore) Debit(context.Context, domain.Movement) (walletstore.DebitResult, error) {
 	return f.debitResult, f.debitErr
 }
 
-func (f *fakeStore) Credit(context.Context, domain.Movement) (walletstore.CreditResult, error) {
-	return f.creditResult, nil
+func (f *fakeStore) Credit(_ context.Context, m domain.Movement) (walletstore.CreditResult, error) {
+	f.gotCredits = append(f.gotCredits, m)
+	return f.creditResult, f.creditErr
 }
 
 func newTestService(st Store) *Service {
-	return New(st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(st, &fakeQuota{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 // TestDebitClassifiesStoreErrors 釘住 sentinel → Code 的分類。

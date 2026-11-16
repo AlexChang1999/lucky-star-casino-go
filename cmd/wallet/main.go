@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/config"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/platform/kafka"
@@ -31,6 +32,7 @@ import (
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/handler"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/memberconsume"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/outbox"
+	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/quota"
 	"github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/service"
 	walletstore "github.com/AlexChang1999/lucky-star-casino-go/internal/wallet/store"
 )
@@ -57,7 +59,8 @@ func run() error {
 	mysqlCfg, mysqlErr := config.LoadMySQL()
 	kafkaCfg, kafkaErr := config.LoadKafka()
 	walletCfg, walletErr := config.LoadWallet()
-	if err := errors.Join(mysqlErr, kafkaErr, walletErr); err != nil {
+	redisCfg, redisErr := config.LoadRedis()
+	if err := errors.Join(mysqlErr, kafkaErr, walletErr, redisErr); err != nil {
 		return fmt.Errorf("載入設定失敗（是不是忘了 set -a; . deploy/.env; set +a）: %w", err)
 	}
 
@@ -124,7 +127,22 @@ func run() error {
 	// 一路傳值下去，沒有容器、沒有反射、沒有 init()。
 	// 依賴方向只往下：handler → service → store（docs/ADR-004）。
 	repo := walletstore.NewRepository(db, logger)
-	walletSvc := service.New(repo, logger)
+
+	// Redis 額度層：**不是快取**而是額度狀態本身（地雷 #16），故障策略是 fail-closed。
+	// ⚠️ 這裡不 Ping：Redis 掛了不該讓帳務服務開不起來（debit/credit 用不到它），
+	// 只有破產救助會在請求時回 500。與下面 Kafka 不做開機自檢是同一個取捨。
+	redisClient := redis.NewClient(&redis.Options{Addr: redisCfg.Addr()})
+	defer func() {
+		if cerr := redisClient.Close(); cerr != nil {
+			logger.Error("關閉 Redis 連線失敗", "err", cerr)
+		}
+	}()
+	quotaStore, err := quota.New(redisClient, logger)
+	if err != nil {
+		return err
+	}
+
+	walletSvc := service.New(repo, quotaStore, logger)
 	walletHandler, err := handler.New(walletSvc, logger)
 	if err != nil {
 		return err
