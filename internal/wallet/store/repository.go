@@ -253,6 +253,23 @@ func (r *Repository) CreateDiamondWallet(ctx context.Context, playerID int64) er
 	return err
 }
 
+// Balance 回傳玩家的**總餘額**（含凍結金額），錢包不存在回 ErrWalletNotFound。
+//
+// ⚠️ 總餘額不是可用餘額：破產救助的資格以總餘額判定，否則玩家可以把錢凍結在
+// 未結算的下注上壓低可用餘額來騙補助（Java BankruptcyAidService 的設計決策）。
+//
+// 單條點查、沒有交易，預設隔離級別在這裡沒有影響。
+func (r *Repository) Balance(ctx context.Context, playerID int64) (int64, error) {
+	var rows []int64
+	if err := r.db.WithContext(ctx).Raw(selectBalance, playerID).Scan(&rows).Error; err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, fmt.Errorf("%w: playerID=%d", ErrWalletNotFound, playerID)
+	}
+	return rows[0], nil
+}
+
 // DebitResult 是一次扣款的結果，對齊 Java 的 DebitResponse。
 //
 // Idempotent 為 true 代表**這次呼叫沒有真的扣款**，回的是原交易的值——

@@ -14,6 +14,10 @@ const (
 	// internalSecretHeader 與 internalPathPrefix 對齊 Java 的 InternalSecretFilter。
 	internalSecretHeader = "X-Internal-Secret"
 	internalPathPrefix   = "/internal/"
+	// playerPathPrefix 是玩家路由。Java 的 /api/v1/** 不驗 secret（靠 gateway 擋），
+	// 這裡**刻意更嚴**：gateway 還不存在時，沒有它任何人都能用 X-User-Id 冒充玩家。
+	// gateway 上線、邊界確立之後再重新評估要不要拿掉。
+	playerPathPrefix = "/api/v1/"
 )
 
 // requestLogger 是結構化的存取日誌。
@@ -72,7 +76,7 @@ func recovery(logger *slog.Logger) fiber.Handler {
 func requireInternalSecret(logger *slog.Logger, secret string) fiber.Handler {
 	expected := []byte(secret)
 	return func(c fiber.Ctx) error {
-		if !strings.HasPrefix(c.Path(), internalPathPrefix) {
+		if p := c.Path(); !strings.HasPrefix(p, internalPathPrefix) && !strings.HasPrefix(p, playerPathPrefix) {
 			return c.Next()
 		}
 		// ⚠️ 定值時間比對，對齊 Java 的 MessageDigest.isEqual。

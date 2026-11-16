@@ -195,7 +195,16 @@ func giftRecvKey(playerID int64, day string) string {
 // 真正的分散式鎖需要「解鎖時比對 owner」的 Lua（Java 版的 rank:broadcast:lock
 // 是那個形狀），這裡不需要，因為只有領取流程自己會釋放它。
 func (s *Store) ClaimBankruptcyAid(ctx context.Context, playerID int64) error {
-	now := s.now()
+	return s.ClaimBankruptcyAidAt(ctx, playerID, s.now())
+}
+
+// ClaimBankruptcyAidAt 與 ClaimBankruptcyAid 相同，但由呼叫端指定「現在」。
+//
+// ⭐ **為什麼需要它**：入帳的冪等鍵 `bankruptcy-aid:{id}:{date}` 與這裡的 Redis key
+// 必須是**同一個日期**。各自讀時鐘的話，23:59:59.9 搶鎖、00:00:00.1 組冪等鍵，
+// 兩把鎖就落在不同的日子——DB 那道第二防線形同虛設。Java 的作法是只呼叫一次
+// `ZonedDateTime.now()` 再同時用於兩處，這裡讓呼叫端做到同一件事。
+func (s *Store) ClaimBankruptcyAidAt(ctx context.Context, playerID int64, now time.Time) error {
 	key := bankruptcyAidKey(playerID, dayStamp(now))
 
 	acquired, err := s.client.SetNX(ctx, key, "1", untilNextMidnight(now)).Result()

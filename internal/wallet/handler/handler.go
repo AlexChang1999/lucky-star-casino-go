@@ -26,6 +26,7 @@ import (
 type WalletService interface {
 	Debit(ctx context.Context, m domain.Movement) (service.DebitResult, error)
 	Credit(ctx context.Context, m domain.Movement) (service.CreditResult, error)
+	BankruptcyAid(ctx context.Context, playerID int64) (service.BankruptcyAidResult, error)
 }
 
 // Handler 持有這一層的依賴。沒有第三個——有第三個就代表有邏輯跑錯層了。

@@ -42,6 +42,10 @@ func (h *Handler) respondServiceError(c fiber.Ctx, err error, m domain.Movement)
 			fmt.Sprintf("Wallet not found for player: %d", m.PlayerID))
 	case service.CodeInsufficientBalance:
 		return respondError(c, fiber.StatusUnprocessableEntity, insufficientMessage)
+	case service.CodeAidBalanceTooHigh:
+		return respondError(c, fiber.StatusUnprocessableEntity, aidBalanceTooHighMessage)
+	case service.CodeAidAlreadyClaimed:
+		return respondError(c, fiber.StatusUnprocessableEntity, aidAlreadyClaimedMessage)
 	case service.CodeConcurrentModification:
 		// 訊息是 Java 寫死的那一句（GlobalExceptionHandler:131），不是 ex.getMessage()。
 		return respondError(c, fiber.StatusConflict, concurrentModifyMessage)
